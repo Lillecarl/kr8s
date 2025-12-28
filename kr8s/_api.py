@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import copy
+import enum
 import json
 import logging
 import ssl
@@ -58,6 +59,28 @@ def _httpx_ws_exception_fixer():
         while isinstance(exc, BaseExceptionGroup) and len(exc.exceptions) == 1:
             exc = exc.exceptions[0]
         raise exc
+
+
+class ApplyPatchOp(enum.Enum):
+    """
+    The method used to apply a patch to a resource.
+    `kubectl apply` uses a Strategic Merge Patch by default, but also supports the other methods.
+    """
+    MERGE = enum.auto()
+    JSON_PATCH = enum.auto()
+    STRATEGIC = enum.auto()
+    SSA = enum.auto()  # Server Side Apply
+    SSA_FORCE = enum.auto()  # Server Side Apply with force option
+
+    def content_type(self) -> str:
+        content_types = {
+            ApplyPatchOp.MERGE: "application/merge-patch+json",
+            ApplyPatchOp.JSON_PATCH: "application/json-patch+json",
+            ApplyPatchOp.STRATEGIC: "application/strategic-merge-patch+json",
+            ApplyPatchOp.SSA: "application/apply-patch+yaml",
+            ApplyPatchOp.SSA_FORCE: "application/apply-patch+yaml",
+        }
+        return content_types[self]
 
 
 class Api:
@@ -760,15 +783,15 @@ class Api:
         return await self.async_create(resources)
 
 
-    async def async_apply(self, resources: list[APIObject]):
+    async def async_apply(self, resources: list[APIObject], op: ApplyPatchOp = ApplyPatchOp.STRATEGIC):
         """Use server-side apply to create or update resources."""
         async with anyio.create_task_group() as tg:
             for resource in resources:
-                tg.start_soon(resource.async_apply)
+                tg.start_soon(resource.async_apply, op)
 
-    async def apply(self, resources: list[APIObject]):
+    async def apply(self, resources: list[APIObject], op: ApplyPatchOp = ApplyPatchOp.STRATEGIC):
         """Use server-side apply to create or update resources."""
-        return await self.async_apply(resources)
+        return await self.async_apply(resources, op)
 
     @property
     def __version__(self) -> str:
