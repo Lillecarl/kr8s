@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import copy
-import enum
 import json
 import logging
 import ssl
@@ -16,9 +15,7 @@ import weakref
 from collections.abc import AsyncGenerator
 from contextlib import contextmanager
 from importlib.metadata import version as metadata_version
-from typing import (
-    TYPE_CHECKING,
-)
+from typing import TYPE_CHECKING, Literal
 
 import anyio
 import httpx
@@ -61,28 +58,17 @@ def _httpx_ws_exception_fixer():
         raise exc
 
 
-class ApplyPatchOp(enum.Enum):
-    """
-    The method used to apply a patch to a resource.
+ApplyOpTypes = Literal["merge", "json", "strategic", "ssa"]
 
-    `kubectl apply` uses a Strategic Merge Patch by default, but also supports the other methods.
-    """
 
-    MERGE = enum.auto()
-    JSON_PATCH = enum.auto()
-    STRATEGIC = enum.auto()
-    SSA = enum.auto()  # Server Side Apply
-    SSA_FORCE = enum.auto()  # Server Side Apply with force option
-
-    def content_type(self) -> str:
-        content_types = {
-            ApplyPatchOp.MERGE: "application/merge-patch+json",
-            ApplyPatchOp.JSON_PATCH: "application/json-patch+json",
-            ApplyPatchOp.STRATEGIC: "application/strategic-merge-patch+json",
-            ApplyPatchOp.SSA: "application/apply-patch+yaml",
-            ApplyPatchOp.SSA_FORCE: "application/apply-patch+yaml",
-        }
-        return content_types[self]
+def _apply_op_content_type(op: ApplyOpTypes) -> str:
+    content_types = {
+        "merge": "application/merge-patch+json",
+        "json": "application/json-patch+json",
+        "strategic": "application/strategic-merge-patch+json",
+        "ssa": "application/apply-patch+yaml",
+    }
+    return content_types[op]
 
 
 class Api:
@@ -789,18 +775,24 @@ class Api:
         return await self.async_create(resources)
 
     async def async_apply(
-        self, resources: list[APIObject], op: ApplyPatchOp = ApplyPatchOp.STRATEGIC
+        self,
+        resources: list[APIObject],
+        server_side: bool = False,
+        force_conflicts: bool = False,
     ):
         """Use server-side apply to create or update resources."""
         async with anyio.create_task_group() as tg:
             for resource in resources:
-                tg.start_soon(resource.async_apply, op)
+                tg.start_soon(resource.async_apply, server_side, force_conflicts)
 
     async def apply(
-        self, resources: list[APIObject], op: ApplyPatchOp = ApplyPatchOp.STRATEGIC
+        self,
+        resources: list[APIObject],
+        server_side: bool = False,
+        force_conflicts: bool = False,
     ):
         """Use server-side apply to create or update resources."""
-        return await self.async_apply(resources, op)
+        return await self.async_apply(resources, server_side, force_conflicts)
 
     @property
     def __version__(self) -> str:
