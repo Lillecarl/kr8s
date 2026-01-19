@@ -18,7 +18,7 @@ import yaml
 import kr8s
 from kr8s._api import Api
 from kr8s._async_utils import anext
-from kr8s._exceptions import NotFoundError
+from kr8s._exceptions import NotFoundError, ServerError
 from kr8s._exec import CompletedExec, ExecError
 from kr8s.asyncio.objects import (
     APIObject,
@@ -140,6 +140,13 @@ async def test_pod_force_delete(example_pod_spec):
     await pod.delete(force=True)
     await anyio.sleep(0.1)
     assert not await pod.exists()
+
+
+async def test_pod_create_validate(example_pod_spec):
+    pod = await Pod(example_pod_spec)
+    pod["unknown"] = "value"
+    with pytest.raises(ServerError):
+        await pod.create(validate="strict")
 
 
 def test_pod_force_delete_sync(example_pod_spec):
@@ -612,6 +619,14 @@ async def test_patch_pod_json(example_pod_spec):
     )
     assert set(pod.labels) == {"patched"}
     await pod.delete()
+
+
+async def test_patch_pod_validate(example_pod_spec):
+    pod = await Pod(example_pod_spec)
+    await pod.create()
+    assert "patched" not in pod.labels
+    with pytest.raises(ServerError):
+        await pod.patch({"unknown": "value"}, validate="strict")
 
 
 async def test_all_v1_objects_represented():
