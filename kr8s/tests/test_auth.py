@@ -205,6 +205,70 @@ async def test_kubeconfig_context(kubeconfig_with_second_context):
     assert await anext(api.get("pods", namespace=kr8s.ALL))
 
 
+@pytest.fixture
+async def kubeconfig_without_current_context(k8s_cluster):
+    kubeconfig = yaml.safe_load(k8s_cluster.kubeconfig_path.read_text())
+    context_name = kubeconfig["contexts"][0]["name"]
+    kubeconfig.pop("current-context", None)
+    with tempfile.NamedTemporaryFile() as f:
+        f.write(yaml.safe_dump(kubeconfig).encode())
+        f.flush()
+        yield f.name, context_name
+
+
+async def test_kubeconfig_context_no_current_context(
+    kubeconfig_without_current_context,
+):
+    kubeconfig_path, context_name = kubeconfig_without_current_context
+    api = await kr8s.asyncio.api(kubeconfig=kubeconfig_path, context=context_name)
+    assert api.auth.active_context == context_name
+    assert api.auth.namespace == "default"
+    assert await anext(api.get("pods", namespace=kr8s.ALL))
+
+
+async def test_explicit_context_namespace_without_current_context(
+    kubeconfig_without_current_context,
+):
+    """The explicit context's namespace is used when current-context is unset."""
+    kubeconfig_path, context_name = kubeconfig_without_current_context
+    with open(kubeconfig_path) as f:
+        kubeconfig = yaml.safe_load(f)
+    kubeconfig["contexts"][0]["context"]["namespace"] = "kube-system"
+    with open(kubeconfig_path, "w") as f:
+        yaml.safe_dump(kubeconfig, f)
+
+    api = await kr8s.asyncio.api(kubeconfig=kubeconfig_path, context=context_name)
+    assert api.auth.namespace == "kube-system"
+
+
+async def test_explicit_context_overrides_current_context_namespace(k8s_cluster):
+    """An explicit context wins over current-context, including its namespace."""
+    kubeconfig = yaml.safe_load(k8s_cluster.kubeconfig_path.read_text())
+    base = kubeconfig["contexts"][0]["context"]
+    kubeconfig["contexts"].append(
+        {"name": "other", "context": {**base, "namespace": "kube-system"}}
+    )
+    with tempfile.NamedTemporaryFile() as f:
+        f.write(yaml.safe_dump(kubeconfig).encode())
+        f.flush()
+        api = await kr8s.asyncio.api(kubeconfig=f.name, context="other")
+    assert api.auth.active_context == "other"
+    assert api.auth.namespace == "kube-system"
+
+
+async def test_no_current_context_and_no_explicit_context(
+    kubeconfig_without_current_context,
+):
+    # Documents current behaviour: with no current-context and no explicit
+    # context, kr8s raises a KeyError.
+    # TODO: this should raise a clearer error (e.g. ValueError
+    # "current-context is not set") to match kubectl, rather than a raw
+    # KeyError. Tracked separately.
+    kubeconfig_path, _ = kubeconfig_without_current_context
+    with pytest.raises(KeyError):
+        await kr8s.asyncio.api(kubeconfig=kubeconfig_path)
+
+
 async def test_default_service_account(k8s_cluster):
     api = await kr8s.asyncio.api(kubeconfig=k8s_cluster.kubeconfig_path)
     assert (
