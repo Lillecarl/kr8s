@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2023-2026, Kr8s Developers (See LICENSE for list)
 # SPDX-License-Identifier: BSD 3-Clause License
+import copy
 import importlib
 import logging
 import queue
@@ -655,6 +656,52 @@ async def test_apply_twice_over_the_same_object(example_pod_spec, server_side):
 
     await pod.apply(server_side=server_side)
     assert await pod.exists(), "Pod should still exist after a second apply"
+
+
+@pytest.mark.parametrize("dry_run", ["server", True])
+async def test_apply_dry_run_does_not_persist(example_pod_spec, dry_run):
+    pod = await Pod(example_pod_spec)
+    await pod.apply(dry_run=dry_run)
+    assert not await pod.exists(), "A dry run must not create the object"
+
+
+async def test_apply_dry_run_leaves_raw_alone(example_pod_spec):
+    """A dry run stores nothing, so keeping its answer would leave the object
+    holding a resourceVersion and a uid that no stored object has."""
+    pod = await Pod(example_pod_spec)
+    await pod.apply()
+    before = copy.deepcopy(pod.raw.to_dict())
+
+    await pod.apply(dry_run="server")
+
+    assert pod.raw.to_dict() == before
+
+
+async def test_apply_dry_run_still_validates(example_pod_spec):
+    """The point of a server dry run: admission and validation run, so this
+    is refused without anything being stored."""
+    pod = await Pod(example_pod_spec)
+    pod["my_field"] = "value"
+    with pytest.raises(ServerError):
+        await pod.apply(dry_run="server", validate="strict")
+    assert not await pod.exists()
+
+
+@pytest.mark.parametrize("dry_run", ["none", False])
+async def test_apply_without_dry_run_persists(example_pod_spec, dry_run):
+    pod = await Pod(example_pod_spec)
+    await pod.apply(dry_run=dry_run)
+    assert await pod.exists()
+
+
+async def test_apply_rejects_an_unknown_dry_run_strategy(example_pod_spec):
+    """`kubectl` also takes `--dry-run=client`, which has nothing to print
+    here. Accepting it as a no-op would make a caller who asked for a dry run
+    get a real write, so it is refused instead."""
+    pod = await Pod(example_pod_spec)
+    with pytest.raises(ValueError, match="Invalid dry_run option"):
+        await pod.apply(dry_run="client")
+    assert not await pod.exists()
 
 
 async def test_apply_validate_strict(example_pod_spec):

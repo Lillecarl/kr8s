@@ -56,6 +56,40 @@ await deploy.apply(server_side=True)
 
 `````
 
+## Check an apply without storing it
+
+Pass `dry_run="server"` to ask the API server what the apply would do. It runs
+validation and admission controllers and then discards the result, so nothing is
+stored and the object is left as it was.
+
+`````{tab-set}
+
+````{tab-item} Sync
+:sync: sync
+```python
+from kr8s.objects import Deployment
+
+deploy = Deployment.get("my-deployment")
+deploy.apply(dry_run="server")
+```
+````
+
+````{tab-item} Async
+:sync: async
+```python
+from kr8s.asyncio.objects import Deployment
+
+deploy = await Deployment.get("my-deployment")
+await deploy.apply(dry_run="server")
+```
+````
+
+`````
+
+`kubectl` also has `--dry-run=client`, which prints the object it would have
+sent. There is nothing to print here, so it is not accepted: asking for a dry
+run and getting a real write would be the worst outcome available.
+
 ## Patch Resources
 
 Use {py:func}`Resource.patch() <kr8s.objects.Resource.patch()>` to patch a resource with a JSON 6902 patch. This is useful for making small changes to a resource, such as updating the image of a deployment.

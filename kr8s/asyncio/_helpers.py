@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: BSD 3-Clause License
 from typing import Optional, Union
 
-from kr8s._api import Api, ValidateOption
+from kr8s._api import Api, DryRunOption, ValidateOption
 from kr8s._objects import APIObject
 
 from ._api import api as _api
@@ -129,6 +129,7 @@ async def apply(
     server_side: bool = False,
     force_conflicts: bool = False,
     validate: ValidateOption = "strict",
+    dry_run: DryRunOption = "none",
 ) -> None:
     """Create or update resources in the Kubernetes cluster using server-side apply."""
     if api is None:
@@ -138,6 +139,7 @@ async def apply(
         server_side=server_side,
         force_conflicts=force_conflicts,
         validate=validate,
+        dry_run=dry_run,
     )
 
 

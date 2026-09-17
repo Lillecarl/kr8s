@@ -16,7 +16,7 @@ import weakref
 from collections.abc import AsyncGenerator
 from contextlib import contextmanager
 from importlib.metadata import version as metadata_version
-from typing import TYPE_CHECKING, Literal, Union
+from typing import TYPE_CHECKING, Literal, Optional, Union
 
 import anyio
 import httpx
@@ -63,6 +63,25 @@ ApplyOpTypes = Literal["merge", "json", "strategic", "ssa"]
 ValidateOption = Union[
     Literal["strict", "warn", "ignore", "Strict", "Warn", "Ignore"], bool
 ]
+DryRunOption = Union[Literal["none", "server"], bool]
+
+
+def _dry_run_param(dry_run: DryRunOption) -> Optional[str]:
+    """The `dryRun` query parameter, or None to make the request for real.
+
+    `kubectl` also takes `--dry-run=client`, which prints the object it would
+    have sent. A library call has nothing to print, so there is no useful
+    thing for it to do. It is rejected rather than accepted as a no-op,
+    because a caller who asks for a dry run and gets a real write has the
+    worst outcome available here.
+    """
+    if dry_run is True or dry_run == "server":
+        return "All"
+    if dry_run is False or dry_run == "none":
+        return None
+    raise ValueError(
+        f"Invalid dry_run option {dry_run!r}, expected 'none', 'server', True or False."
+    )
 
 
 def _apply_op_content_type(op: ApplyOpTypes) -> str:
@@ -771,18 +790,31 @@ class Api:
                 yield version["groupVersion"]
 
     async def async_create(
-        self, resources: list[APIObject], *, validate: ValidateOption = "ignore"
+        self,
+        resources: list[APIObject],
+        *,
+        validate: ValidateOption = "ignore",
+        dry_run: DryRunOption = "none",
     ):
         async with anyio.create_task_group() as tg:
             for resource in resources:
                 tg.start_soon(
-                    functools.partial(resource.async_create, validate=validate)
+                    functools.partial(
+                        resource.async_create, validate=validate, dry_run=dry_run
+                    )
                 )
 
     async def create(
-        self, resources: list[APIObject], *, validate: ValidateOption = "ignore"
+        self,
+        resources: list[APIObject],
+        *,
+        validate: ValidateOption = "ignore",
+        dry_run: DryRunOption = "none",
     ):
-        return await self.async_create(resources)
+        # `validate` was dropped here rather than forwarded. Passing `dry_run`
+        # through the same call has to fix that too, or a dry run through this
+        # entry point would create for real.
+        return await self.async_create(resources, validate=validate, dry_run=dry_run)
 
     async def async_apply(
         self,
@@ -791,6 +823,7 @@ class Api:
         server_side: bool = False,
         force_conflicts: bool = False,
         validate: ValidateOption = "strict",
+        dry_run: DryRunOption = "none",
     ):
         """Use server-side apply to create or update resources."""
         async with anyio.create_task_group() as tg:
@@ -801,6 +834,7 @@ class Api:
                         server_side=server_side,
                         force_conflicts=force_conflicts,
                         validate=validate,
+                        dry_run=dry_run,
                     )
                 )
 
@@ -811,6 +845,7 @@ class Api:
         server_side: bool = False,
         force_conflicts: bool = False,
         validate: ValidateOption = "strict",
+        dry_run: DryRunOption = "none",
     ):
         """Use server-side apply to create or update resources."""
         return await self.async_apply(
@@ -818,6 +853,7 @@ class Api:
             server_side=server_side,
             force_conflicts=force_conflicts,
             validate=validate,
+            dry_run=dry_run,
         )
 
     @property

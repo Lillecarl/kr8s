@@ -31,7 +31,14 @@ else:
 
 import kr8s
 import kr8s.asyncio
-from kr8s._api import Api, ApplyOpTypes, ValidateOption, _apply_op_content_type
+from kr8s._api import (
+    Api,
+    ApplyOpTypes,
+    DryRunOption,
+    ValidateOption,
+    _apply_op_content_type,
+    _dry_run_param,
+)
 from kr8s._async_utils import as_sync_func, as_sync_generator
 from kr8s._data_utils import (
     dict_to_selector,
@@ -366,11 +373,19 @@ class APIObject:
             )
         return False
 
-    async def async_create(self, *, validate: ValidateOption = "ignore") -> None:
+    async def async_create(
+        self,
+        *,
+        validate: ValidateOption = "ignore",
+        dry_run: DryRunOption = "none",
+    ) -> None:
         """Create this object in Kubernetes."""
         assert self.api
 
         params = {"fieldValidation": self._field_validation_header(validate)}
+        dry_run_param = _dry_run_param(dry_run)
+        if dry_run_param:
+            params["dryRun"] = dry_run_param
         async with self.api.call_api(
             "POST",
             version=self.version,
@@ -379,12 +394,20 @@ class APIObject:
             content=json.dumps(self.raw_template),
             params=params,
         ) as resp:
-            self.raw = resp.json()
+            # A dry run stores nothing, so keeping its answer would leave this
+            # object holding a resourceVersion and a uid that no object has.
+            if not dry_run_param:
+                self.raw = resp.json()
             self._warn_server_response(resp)
 
-    async def create(self, *, validate: ValidateOption = "ignore") -> None:
+    async def create(
+        self,
+        *,
+        validate: ValidateOption = "ignore",
+        dry_run: DryRunOption = "none",
+    ) -> None:
         """Create this object in Kubernetes."""
-        return await self.async_create(validate=validate)
+        return await self.async_create(validate=validate, dry_run=dry_run)
 
     async def async_apply(
         self,
@@ -392,8 +415,25 @@ class APIObject:
         server_side: bool = False,
         force_conflicts: bool = False,
         validate: ValidateOption = "strict",
+        dry_run: DryRunOption = "none",
     ) -> None:
-        """Create or update this object in Kubernetes using server-side apply."""
+        """Create or update this object in Kubernetes using server-side apply.
+
+        Args:
+            server_side: Use server-side apply, so the API server records
+                which fields this manager owns.
+            force_conflicts: Take a field another manager owns instead of
+                getting a 409. Server-side apply only.
+            validate: How the API server treats fields it does not know.
+            dry_run: ``"server"`` (or ``True``) asks the API server what the
+                apply would do, without storing it, so admission and
+                validation still run. ``self.raw`` is left alone, because a
+                dry run stores nothing to describe.
+
+        Example:
+            >>> deployment = await Deployment.get("my-deployment")
+            >>> await deployment.async_apply(dry_run="server")
+        """
         assert self.api
         # `managedFields` must be nil in an apply body. Drop it from a copy
         # rather than from `self`: assigning `self.metadata.managedFields`
@@ -406,6 +446,9 @@ class APIObject:
         }
 
         params = {}
+        dry_run_param = _dry_run_param(dry_run)
+        if dry_run_param:
+            params["dryRun"] = dry_run_param
         # fieldManager
         if self.api.field_manager:
             field_manager = self.api.field_manager
@@ -438,11 +481,15 @@ class APIObject:
                 headers={"Content-Type": _apply_op_content_type(op_type)},
                 params=params,
             ) as resp:
-                self.raw = resp.json()
+                if not dry_run_param:
+                    self.raw = resp.json()
                 self._warn_server_response(resp)
         except ServerError as e:
             if e.response and e.response.status_code == 404:
-                await self.async_create(validate=validate)
+                # The object does not exist yet, so the apply becomes a
+                # create. `dry_run` has to come with it, or a dry run of an
+                # apply that creates would create for real.
+                await self.async_create(validate=validate, dry_run=dry_run)
             else:
                 raise
 
@@ -466,10 +513,14 @@ class APIObject:
         server_side: bool = False,
         force_conflicts: bool = False,
         validate: ValidateOption = "strict",
+        dry_run: DryRunOption = "none",
     ) -> None:
         """Create or update this object in Kubernetes using server-side apply."""
         return await self.async_apply(
-            server_side=server_side, force_conflicts=force_conflicts, validate=validate
+            server_side=server_side,
+            force_conflicts=force_conflicts,
+            validate=validate,
+            dry_run=dry_run,
         )
 
     async def delete(
@@ -1076,8 +1127,13 @@ class APIObjectSyncMixin(APIObject):
     def exists(self, ensure=False) -> bool:  # type: ignore[override]
         return as_sync_func(self.async_exists)(ensure=ensure)
 
-    def create(self, *, validate: ValidateOption = "ignore"):  # type: ignore[override]
-        return as_sync_func(self.async_create)(validate=validate)
+    def create(  # type: ignore[override]
+        self,
+        *,
+        validate: ValidateOption = "ignore",
+        dry_run: DryRunOption = "none",
+    ):
+        return as_sync_func(self.async_create)(validate=validate, dry_run=dry_run)
 
     def apply(
         self,
@@ -1085,9 +1141,13 @@ class APIObjectSyncMixin(APIObject):
         server_side: bool = False,
         force_conflicts: bool = False,
         validate: ValidateOption = "strict",
+        dry_run: DryRunOption = "none",
     ):
         return as_sync_func(self.async_apply)(
-            server_side=server_side, force_conflicts=force_conflicts, validate=validate
+            server_side=server_side,
+            force_conflicts=force_conflicts,
+            validate=validate,
+            dry_run=dry_run,
         )
 
     def delete(  # type: ignore[override]
