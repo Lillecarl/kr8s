@@ -94,6 +94,23 @@ def _apply_op_content_type(op: ApplyOpTypes) -> str:
     return content_types[op]
 
 
+def _server_error(exc: httpx.HTTPStatusError) -> ServerError:
+    """Translate an error response into a ServerError that carries its body.
+
+    The API server answers 5xx with a Status object too, and for a 500 that
+    body is usually the only clue there is, so both classes read the same
+    way. A body that is not a Status -- a proxy's HTML 502, an empty 503 --
+    falls back to httpx' own message, with the raw text as the status.
+    """
+    try:
+        status = exc.response.json()
+        message = status["message"]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        status = exc.response.text
+        message = str(exc)
+    return ServerError(message, status=status, response=exc.response)
+
+
 class Api:
     """A kr8s object for interacting with the Kubernetes API.
 
@@ -123,6 +140,9 @@ class Api:
         self.field_manager = kwargs.get(
             "field_manager", None
         )  # used in Server Side Apply
+        # Set when the first `await` finishes. Left False if it raises, so a
+        # failed authentication is retried rather than cached.
+        self._ready = False
 
         self.auth = KubeAuth(
             url=self._url,
@@ -144,8 +164,13 @@ class Api:
 
     def __await__(self):
         async def f():
-            await self.auth
-            await self._check_version()
+            # Once per instance, not once per `await`: `api()` returns a
+            # cached Api and then awaits it again, so this ran a kubeconfig
+            # read and a `/version` request on every call.
+            if not self._ready:
+                await self.auth
+                await self._check_version()
+                self._ready = True
             return self
 
         return f().__await__()
@@ -249,23 +274,7 @@ class Api:
                     await self._create_session()
                     continue
                 else:
-                    if e.response.status_code >= 400 and e.response.status_code < 500:
-                        try:
-                            error = e.response.json()
-                            error_message = error["message"]
-                        except json.JSONDecodeError:
-                            error = e.response.text
-                            error_message = str(e)
-                        raise ServerError(
-                            error_message, status=error, response=e.response
-                        ) from e
-                    elif e.response.status_code >= 500:
-                        raise ServerError(
-                            str(e),
-                            status=str(e.response.status_code),
-                            response=e.response,
-                        ) from e
-                    raise
+                    raise _server_error(e) from e
             except ssl.SSLCertVerificationError:
                 # In some rare edge cases the SSL verification fails, so we try again
                 # a few times before giving up.
@@ -431,9 +440,11 @@ class Api:
         if group:
             version = f"{group}/{version}"
         for resource in resources:
+            # `parse_kind` lowercases and `resource["kind"]` is CamelCase, so
+            # the Kind comparison must fold case or it matches nothing.
             if (not version or version in resource["version"]) and (
                 kind == resource["name"]
-                or kind == resource["kind"]
+                or kind == resource["kind"].lower()
                 or kind == resource["singularName"]
                 or ("shortNames" in resource and kind in resource["shortNames"])
             ):
@@ -490,6 +501,11 @@ class Api:
             obj_cls = kind
         else:
             namespaced: bool | None = None
+            # Bound here because the lookup below may not reach the
+            # assignment. `new_class` reads None as "derive the plural from
+            # the kind", which is the best guess available once discovery
+            # has failed.
+            plural: str | None = None
             try:
                 kind, plural, namespaced = await self.async_lookup_kind(kind)
             except ServerError as e:
@@ -798,9 +814,15 @@ class Api:
     ):
         async with anyio.create_task_group() as tg:
             for resource in resources:
+                # Pass `self`, or the request goes through whichever API the
+                # resource happens to be bound to and the `api` argument of
+                # `kr8s.create()` decides nothing.
                 tg.start_soon(
                     functools.partial(
-                        resource.async_create, validate=validate, dry_run=dry_run
+                        resource.async_create,
+                        validate=validate,
+                        dry_run=dry_run,
+                        api=self,
                     )
                 )
 

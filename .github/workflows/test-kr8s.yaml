@@ -25,8 +25,10 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
-        kubernetes-version: ["1.36.4"]
+        kubernetes-version: ["1.37.0"]
         include:
+          - python-version: "3.14"
+            kubernetes-version: 1.36.4
           - python-version: "3.14"
             kubernetes-version: 1.35.8
           - python-version: "3.14"
@@ -67,16 +69,17 @@ jobs:
       matrix:
         # Test the minimal and maximal Python versions only
         python-version: ["3.9", "3.14"]
-        kubernetes-version: ["1.36.4"]
+        kubernetes-version: ["1.37.0"]
     steps:
       - uses: actions/checkout@v2
       - uses: actions/setup-python@v2
         with:
           python-version: ${{ matrix.python-version }}
+      # The runner's own kind, for the reason conftest.py prefers it: the
+      # action installs kind v0.31.0, which writes a `kubeadm.k8s.io/v1beta3`
+      # cluster config that kubeadm refuses from 1.37 on.
       - name: Create k8s Kind Cluster
-        uses: helm/kind-action@v1
-        with:
-          node_image: kindest/node:v${{ matrix.kubernetes-version }}
+        run: kind create cluster --image kindest/node:v${{ matrix.kubernetes-version }} --wait 60s
       - name: Install kr8s
         run: pip install -e .
       - name: Ensure kr8s works
