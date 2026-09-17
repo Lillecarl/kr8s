@@ -424,6 +424,7 @@ class APIObject:
         validate: ValidateOption = "strict",
         dry_run: DryRunOption = "none",
         field_manager: str | None = None,
+        api: Api | None = None,
     ) -> dict:
         """Create or update this object in Kubernetes using server-side apply.
 
@@ -440,6 +441,8 @@ class APIObject:
             field_manager: Own the fields as this manager, instead of the one
                 bound to the API client. A caller that applies objects under
                 several managers cannot express that with the binding alone.
+            api: Send the request through this API client instead of the one
+                bound to this object. The binding is not changed.
 
         Returns:
             The object as the API server merged it. For a dry run this is the
@@ -449,7 +452,8 @@ class APIObject:
             >>> deployment = await Deployment.get("my-deployment")
             >>> merged = await deployment.async_apply(dry_run="server")
         """
-        assert self.api
+        api = api or self.api
+        assert api
         # `managedFields` must be nil in an apply body. Drop it from a copy
         # rather than from `self`: assigning `self.metadata.managedFields`
         # destroys the caller's copy of a field they did not ask us to touch.
@@ -467,8 +471,8 @@ class APIObject:
         # fieldManager: the argument wins over the client-wide binding, so a
         # caller can apply different objects under different managers.
         if field_manager is None:
-            if self.api.field_manager:
-                field_manager = self.api.field_manager
+            if api.field_manager:
+                field_manager = api.field_manager
             elif server_side:
                 field_manager = "kr8s"
             else:
@@ -489,7 +493,7 @@ class APIObject:
         op_type: ApplyOpTypes = "ssa" if server_side else "strategic"
 
         try:
-            async with self.api.call_api(
+            async with api.call_api(
                 "PATCH",
                 version=self.version,
                 url=f"{self.endpoint}/{self.name}",
@@ -534,6 +538,7 @@ class APIObject:
         validate: ValidateOption = "strict",
         dry_run: DryRunOption = "none",
         field_manager: str | None = None,
+        api: Api | None = None,
     ) -> dict:
         """Create or update this object in Kubernetes using server-side apply."""
         return await self.async_apply(
@@ -542,6 +547,7 @@ class APIObject:
             validate=validate,
             dry_run=dry_run,
             field_manager=field_manager,
+            api=api,
         )
 
     async def delete(
@@ -1164,6 +1170,7 @@ class APIObjectSyncMixin(APIObject):
         validate: ValidateOption = "strict",
         dry_run: DryRunOption = "none",
         field_manager: str | None = None,
+        api: Api | None = None,
     ):
         return as_sync_func(self.async_apply)(
             server_side=server_side,
@@ -1171,6 +1178,7 @@ class APIObjectSyncMixin(APIObject):
             validate=validate,
             dry_run=dry_run,
             field_manager=field_manager,
+            api=api,
         )
 
     def delete(  # type: ignore[override]

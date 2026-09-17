@@ -616,6 +616,41 @@ async def test_apply_creates_if_not_exists(example_pod_spec):
     assert await pod.exists(), "Pod should exist after creation"
 
 
+async def test_apply_uses_the_api_it_is_given(example_pod_spec):
+    """`Api.async_apply` delegates to the resource, so without passing itself
+    the request goes through `resource.api` and the `api` argument decides
+    nothing. Same defect as `create` had, same consequence: with two clusters
+    the object lands in the wrong one."""
+    pod = await Pod(example_pod_spec)
+    other = await kr8s.asyncio.api(field_manager="other-manager")
+    assert pod.api is not other
+
+    await kr8s.asyncio.apply([pod], api=other, server_side=True)
+
+    managers = {e["manager"] for e in pod.raw["metadata"]["managedFields"]}
+    assert (
+        "other-manager" in managers
+    ), f"apply used the pod's own api, not the one passed in; managers={managers}"
+    await pod.delete()
+
+
+async def test_apply_without_an_api_keeps_the_objects_binding(example_pod_spec):
+    """With no argument each resource keeps the api it is bound to, so
+    `apply([obj])` and `obj.apply()` reach the same cluster."""
+    default = await kr8s.asyncio.api()
+    bound = await kr8s.asyncio.api(field_manager="bound-to-the-object")
+    assert bound is not default
+
+    pod = await Pod(example_pod_spec, api=bound)
+    await kr8s.asyncio.apply([pod], server_side=True)
+
+    managers = {e["manager"] for e in pod.raw["metadata"]["managedFields"]}
+    assert (
+        "bound-to-the-object" in managers
+    ), f"apply ignored the api the pod is bound to; managers={managers}"
+    await pod.delete()
+
+
 async def test_apply_takes_a_field_manager_per_call(example_pod_spec):
     """The client-wide binding cannot express a caller that applies objects
     under several managers in one run, so the argument overrides it."""

@@ -1,6 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2023-2026, Kr8s Developers (See LICENSE for list)
 # SPDX-License-Identifier: BSD 3-Clause License
+import functools
 from typing import Optional, Union
+
+import anyio
 
 from kr8s._api import Api, DryRunOption, ValidateOption
 from kr8s._objects import APIObject
@@ -133,7 +136,20 @@ async def apply(
 ) -> None:
     """Create or update resources in the Kubernetes cluster using server-side apply."""
     if api is None:
-        api = await _api(_asyncio=_asyncio)
+        # No api asked for, so each resource keeps the one it is bound to,
+        # the same rule `create` follows.
+        async with anyio.create_task_group() as tg:
+            for resource in resources:
+                tg.start_soon(
+                    functools.partial(
+                        resource.async_apply,
+                        server_side=server_side,
+                        force_conflicts=force_conflicts,
+                        validate=validate,
+                        dry_run=dry_run,
+                    )
+                )
+        return None
     return await api.async_apply(
         resources,
         server_side=server_side,

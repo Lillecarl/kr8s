@@ -828,6 +828,10 @@ class Api:
         """Use server-side apply to create or update resources."""
         async with anyio.create_task_group() as tg:
             for resource in resources:
+                # Pass `self`, for the same reason `async_create` does: the
+                # request would otherwise go through whichever API the
+                # resource is bound to, and the `api` argument of
+                # `kr8s.apply()` would decide nothing.
                 tg.start_soon(
                     functools.partial(
                         resource.async_apply,
@@ -835,6 +839,7 @@ class Api:
                         force_conflicts=force_conflicts,
                         validate=validate,
                         dry_run=dry_run,
+                        api=self,
                     )
                 )
 
