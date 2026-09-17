@@ -546,8 +546,8 @@ async def test_create_with_apply(example_pod_spec, example_service_spec):
     service = await Service(example_service_spec)
     resources = [pod, service]
     await kr8s.asyncio.apply(resources)
-    assert pod.exists(), "Pod should exist after creation"
-    assert service.exists(), "Service should exist after creation"
+    assert await pod.exists(), "Pod should exist after creation"
+    assert await service.exists(), "Service should exist after creation"
     await pod.delete()
     await service.delete()
 
@@ -576,7 +576,7 @@ async def test_apply_update_with_ssa(example_pod_spec, example_service_spec):
     pod.labels["foo"] = "bar"
     await pod.apply(server_side=True)
     assert pod.labels["foo"] == "bar", "SSA update should send updated resource"
-    assert pod.exists(), "Pod should exist after creation"
+    assert await pod.exists(), "Pod should exist after creation"
     assert pod.labels["foo"] == "bar", "SSA update should send updated resource"
 
 
@@ -594,7 +594,7 @@ async def test_apply_update_with_ssa_force(example_pod_spec, example_service_spe
     other_api = await kr8s.asyncio.api(field_manager="other-manager")
     pod.api = other_api  # api param in helpers is ignored
     await kr8s.asyncio.apply(resources, server_side=True)
-    assert pod.exists(), "Pod should exist after creation"
+    assert await pod.exists(), "Pod should exist after creation"
 
     api = await kr8s.asyncio.api(field_manager="kr8s")
     pod.api = api  # api param in helpers is ignored
@@ -603,7 +603,7 @@ async def test_apply_update_with_ssa_force(example_pod_spec, example_service_spe
         await kr8s.asyncio.apply([pod], server_side=True)
 
     await kr8s.asyncio.apply([pod], server_side=True, force_conflicts=True)
-    assert pod.exists(), "Pod should exist after creation"
+    assert await pod.exists(), "Pod should exist after creation"
     assert (
         pod.labels["my_field"] == "changed"
     ), "SSA update should send updated resource"
@@ -611,8 +611,9 @@ async def test_apply_update_with_ssa_force(example_pod_spec, example_service_spe
 
 async def test_apply_creates_if_not_exists(example_pod_spec):
     pod = await Pod(example_pod_spec)
+    assert not await pod.exists()
     await pod.apply()
-    assert pod.exists(), "Pod should exist after creation"
+    assert await pod.exists(), "Pod should exist after creation"
 
 
 async def test_a_failed_apply_leaves_managed_fields_alone(example_pod_spec):
