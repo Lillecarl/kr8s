@@ -614,6 +614,33 @@ async def test_apply_creates_if_not_exists(example_pod_spec):
     assert pod.exists(), "Pod should exist after creation"
 
 
+@pytest.mark.parametrize("server_side", [False, True])
+async def test_apply_twice_over_the_same_object(example_pod_spec, server_side):
+    """An apply stores the API server's answer in ``raw``, so a second apply
+    of the same object sends back whatever that answer carried.
+
+    Two fields in it are refused. ``metadata.managedFields`` comes back with
+    "must be nil", and ``metadata.resourceVersion`` makes the request an
+    optimistic lock, so it answers 409 as soon as anything else has written
+    to the object. Neither is a field the caller asked to send.
+
+    ``async_apply`` drops the first and ``raw_template`` drops the second.
+    This covers both, because nothing else applies the same object twice.
+    """
+    pod = await Pod(example_pod_spec)
+    await pod.apply(server_side=server_side)
+    assert "managedFields" in pod.raw["metadata"]
+    assert "resourceVersion" in pod.raw["metadata"]
+
+    # Move the object on through a second handle, so the resourceVersion this
+    # one holds is stale -- what another writer does to it in the meantime.
+    other = await Pod.get(pod.name, namespace=pod.namespace)
+    await other.patch({"metadata": {"labels": {"bump": "1"}}})
+
+    await pod.apply(server_side=server_side)
+    assert await pod.exists(), "Pod should still exist after a second apply"
+
+
 async def test_apply_validate_strict(example_pod_spec):
     pod = await Pod(example_pod_spec)
     pod["my_field"] = "value"
