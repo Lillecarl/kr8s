@@ -614,6 +614,22 @@ async def test_apply_creates_if_not_exists(example_pod_spec):
     assert pod.exists(), "Pod should exist after creation"
 
 
+async def test_a_failed_apply_leaves_managed_fields_alone(example_pod_spec):
+    """The apply body is built from a copy, so a request that never succeeds
+    does not leave the caller's object stripped of a field it had."""
+    pod = await Pod(example_pod_spec)
+    await pod.apply()
+    assert pod.raw["metadata"]["managedFields"]
+
+    pod["my_field"] = "value"
+    with pytest.raises(ServerError):
+        await pod.apply(validate="strict")
+
+    assert pod.raw["metadata"][
+        "managedFields"
+    ], "a failed apply destroyed managedFields on the object"
+
+
 @pytest.mark.parametrize("server_side", [False, True])
 async def test_apply_twice_over_the_same_object(example_pod_spec, server_side):
     """An apply stores the API server's answer in ``raw``, so a second apply

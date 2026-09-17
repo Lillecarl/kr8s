@@ -395,8 +395,15 @@ class APIObject:
     ) -> None:
         """Create or update this object in Kubernetes using server-side apply."""
         assert self.api
-        # Remove managedFields which must be nil when using server-side apply
-        self.metadata.managedFields = None
+        # `managedFields` must be nil in an apply body. Drop it from a copy
+        # rather than from `self`: assigning `self.metadata.managedFields`
+        # destroys the caller's copy of a field they did not ask us to touch.
+        # A normal apply hides that by replacing `raw` with the response, so
+        # it only becomes visible when nothing is stored.
+        body = self.raw_template
+        body["metadata"] = {
+            k: v for k, v in body.get("metadata", {}).items() if k != "managedFields"
+        }
 
         params = {}
         # fieldManager
@@ -427,7 +434,7 @@ class APIObject:
                 version=self.version,
                 url=f"{self.endpoint}/{self.name}",
                 namespace=self.namespace,
-                content=json.dumps(self.raw_template),
+                content=json.dumps(body),
                 headers={"Content-Type": _apply_op_content_type(op_type)},
                 params=params,
             ) as resp:
