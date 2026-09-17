@@ -50,12 +50,12 @@ await pod.create()
 
 ## Create or Update a Resource
 
-Create or update a resource by calling {py:meth}`Resource.apply() <kr8s.objects.Resource.apply()>`.
+Create or update a resource by calling {py:meth}`Ingress.apply() <kr8s.objects.Ingress.apply()>`.
 
 `````{tab-set}
 
 ````{tab-item} Sync
-:sync:
+:sync: sync
 ```python
 from kr8s.objects import Ingress
 
@@ -69,7 +69,7 @@ ingress.apply()
 ```python
 from kr8s.asyncio.objects import Ingress
 
-ingress = Ingress(...)
+ingress = await Ingress(...)
 await ingress.apply()
 ```
 ````

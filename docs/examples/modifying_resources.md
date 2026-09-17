@@ -2,17 +2,17 @@
 
 ## Modify fields with Apply
 
-Apply changes to a resource using {py:func}`Resource.apply() <kr8s.objects.Resource.apply()>`. For example, updating the resource limits of a deployment.
+Apply a resource with {py:func}`Deployment.apply() <kr8s.objects.Deployment.apply()>`. The object itself is the request body, so a partial one updates only the fields it sets — here the memory limit of a deployment. Containers are merged by name, so `name` has to be there for the right one to be found.
 
 `````{tab-set}
 
 ````{tab-item} Sync
-:sync:
+:sync: sync
 ```python
 from kr8s.objects import Deployment
 
-deploy = Deployment.get("my-deployment")
-deploy.apply({"spec": { "template": {"spec": {"containers": [{"resources": {"limits": {"memory": "5Gi"}}}]}}}})
+deploy = Deployment({"metadata": {"name": "my-deployment"}, "spec": {"template": {"spec": {"containers": [{"name": "alpine", "resources": {"limits": {"memory": "5Gi"}}}]}}}})
+deploy.apply()
 ```
 ````
 
@@ -21,8 +21,8 @@ deploy.apply({"spec": { "template": {"spec": {"containers": [{"resources": {"lim
 ```python
 from kr8s.asyncio.objects import Deployment
 
-deploy = await Deployment.get("my-deployment")
-await deploy.apply({"spec": { "template": {"spec": {"containers": [{"resources": {"limits": {"memory": "5Gi"}}}]}}}})
+deploy = await Deployment({"metadata": {"name": "my-deployment"}, "spec": {"template": {"spec": {"containers": [{"name": "alpine", "resources": {"limits": {"memory": "5Gi"}}}]}}}})
+await deploy.apply()
 ```
 ````
 
@@ -35,7 +35,7 @@ await deploy.apply({"spec": { "template": {"spec": {"containers": [{"resources":
 `````{tab-set}
 
 ````{tab-item} Sync
-:sync:
+:sync: sync
 ```python
 from kr8s.objects import Deployment
 
@@ -92,30 +92,33 @@ run and getting a real write would be the worst outcome available.
 
 ## Patch Resources
 
-Use {py:func}`Resource.patch() <kr8s.objects.Resource.patch()>` to patch a resource with a JSON 6902 patch. This is useful for making small changes to a resource, such as updating the image of a deployment.
+Use {py:func}`Deployment.patch() <kr8s.objects.Deployment.patch()>` to patch a resource with a JSON 6902 patch. This is useful for making small changes to a resource, such as updating the image of a deployment. `type="json"` selects that patch format; without it the body is sent as a merge patch.
 
 `````{tab-set}
 
 ````{tab-item} Sync
-:sync:
-
+:sync: sync
 ```python
-import kr8s
 from kr8s.objects import Deployment
 
 deploy = Deployment.get("my-deployment")
-deploy.patch([{"op": "replace", "path": "/spec/template/spec/containers/0/image", "value": "my-app:latest"}])
+deploy.patch(
+    [{"op": "replace", "path": "/spec/template/spec/containers/0/image", "value": "my-app:latest"}],
+    type="json",
+)
 ```
 ````
 
 ````{tab-item} Async
 :sync: async
 ```python
-import kr8s
 from kr8s.asyncio.objects import Deployment
 
 deploy = await Deployment.get("my-deployment")
-await deploy.patch([{"op": "replace", "path": "/spec/template/spec/containers/0/image", "value": "my-app:latest"}])
+await deploy.patch(
+    [{"op": "replace", "path": "/spec/template/spec/containers/0/image", "value": "my-app:latest"}],
+    type="json",
+)
 ```
 ````
 
