@@ -559,6 +559,44 @@ async def test_create_uses_the_api_it_is_given(example_pod_spec, k8s_cluster):
     await pod.delete()
 
 
+async def test_create_without_an_api_keeps_the_objects_binding(
+    example_pod_spec, k8s_cluster
+):
+    """With no `api` argument, each resource is sent through the api it is
+    bound to, so `create([obj])` and `obj.create()` reach the same cluster.
+
+    Resolving a default here and sending everything through that would move
+    an object that was explicitly given an api of its own.
+    """
+    # `api()` with no arguments returns the first cached instance, so take
+    # that one first: `bound` must not be the api the helper would resolve,
+    # or forcing the resolved one would look identical to honouring the
+    # binding and this would pass either way.
+    default = await kr8s.asyncio.api()
+    kubeconfig = yaml.safe_load(k8s_cluster.kubeconfig_path.read_text())
+    bound = await kr8s.asyncio.api(context=kubeconfig["current-context"])
+    assert bound is not default
+
+    pod = await Pod(example_pod_spec, api=bound)
+    assert pod.api is bound
+
+    calls = []
+    real = bound.call_api
+
+    def recording(*args, **kwargs):
+        calls.append(kwargs.get("method", args[0] if args else None))
+        return real(*args, **kwargs)
+
+    bound.call_api = recording
+    try:
+        await kr8s.asyncio.create([pod])
+    finally:
+        bound.call_api = real
+
+    assert "POST" in calls, f"create() did not use the pod's own api; calls={calls}"
+    await pod.delete()
+
+
 def test_create_sync(example_pod_spec, example_service_spec):
     pod = SyncPod(example_pod_spec)
     service = SyncService(example_service_spec)
