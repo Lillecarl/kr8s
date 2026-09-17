@@ -159,6 +159,46 @@ async def test_api_factory_with_kubeconfig(k8s_cluster, serviceaccount) -> None:
     assert p3.api is not k2
 
 
+async def test_the_factory_checks_the_version_once():
+    """`api()` returns a cached Api and awaits it again, so the check has to
+    be per instance rather than per await. It costs a `/version` request, and
+    a caller that asks for an Api per operation used to pay one every time."""
+    api = await kr8s.asyncio.api()
+    keep = api.async_version
+    calls = 0
+
+    async def counting_version():
+        nonlocal calls
+        calls += 1
+        return await keep()
+
+    api.async_version = counting_version
+    try:
+        for _ in range(3):
+            again = await kr8s.asyncio.api()
+            assert again is api
+    finally:
+        api.async_version = keep
+
+    assert calls == 0, "a cached Api re-ran the version check"
+
+
+async def test_a_failed_first_await_is_not_cached_as_ready():
+    """`_ready` is set after the work, not before it, so authentication that
+    fails is retried rather than remembered as done."""
+    api = await kr8s.asyncio.api()
+    api._ready = False
+    boom = RuntimeError("the credentials are not there yet")
+
+    with patch.object(api, "_check_version", side_effect=boom):
+        with pytest.raises(RuntimeError, match="not there yet"):
+            await api
+
+    assert api._ready is False
+    await api
+    assert api._ready is True
+
+
 def test_version_sync():
     api = kr8s.api()
     version = api.version()

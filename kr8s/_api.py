@@ -86,6 +86,9 @@ class Api:
         self._serviceaccount = kwargs.get("serviceaccount")
         self._session: httpx.AsyncClient | None = None
         self._timeout = None
+        # Set when the first `await` finishes. Left False if it raises, so a
+        # failed authentication is retried rather than cached.
+        self._ready = False
         self.auth = KubeAuth(
             url=self._url,
             kubeconfig=self._kubeconfig,
@@ -106,8 +109,13 @@ class Api:
 
     def __await__(self):
         async def f():
-            await self.auth
-            await self._check_version()
+            # Once per instance, not once per `await`: `api()` returns a
+            # cached Api and then awaits it again, so this ran a kubeconfig
+            # read and a `/version` request on every call.
+            if not self._ready:
+                await self.auth
+                await self._check_version()
+                self._ready = True
             return self
 
         return f().__await__()
