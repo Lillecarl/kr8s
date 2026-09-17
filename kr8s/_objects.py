@@ -485,6 +485,88 @@ class APIObject:
                 ) from e
             raise e
 
+    async def apply(
+        self,
+        *,
+        field_manager: str,
+        force: bool = False,
+        dry_run: bool = False,
+    ) -> dict:
+        """Server-side apply this object to Kubernetes."""
+        return await self.async_apply(
+            field_manager=field_manager, force=force, dry_run=dry_run
+        )
+
+    async def async_apply(
+        self,
+        *,
+        field_manager: str,
+        force: bool = False,
+        dry_run: bool = False,
+    ) -> dict:
+        """Server-side apply this object to Kubernetes.
+
+        Sends the whole object as an apply configuration, so the API server
+        records which fields ``field_manager`` owns and drops the ones it
+        stops declaring. Unlike a merge patch, a field this object no longer
+        sets is removed rather than left behind.
+
+        Args:
+            field_manager: Name recorded as the owner of the fields this
+                object declares. Two writers sharing one name are one manager
+                to the API server, and each apply replaces the other's field
+                set.
+            force: Take ownership of a field another manager owns. Without it
+                a contested field makes the API server answer 409.
+            dry_run: Ask for the object that would result, without persisting
+                it. ``self.raw`` is left untouched.
+
+        Returns:
+            The object as the API server merged it.
+
+        Example:
+            >>> deployment = await Deployment.get("my-deployment")
+            >>> await deployment.async_apply(field_manager="my-controller")
+        """
+        assert self.api
+        params = {
+            "fieldManager": field_manager,
+            "force": "true" if force else "false",
+        }
+        if dry_run:
+            params["dryRun"] = "All"
+        # An apply configuration may carry neither ``metadata.managedFields``,
+        # which the API server refuses with "must be nil", nor
+        # ``resourceVersion``, which makes the apply an optimistic lock and so
+        # a 409 whenever anything moved since the read. Both are in ``raw``
+        # only because a previous apply or get stored the server's answer
+        # there, so neither is something the caller asked to send.
+        body = dict(self.raw)
+        body["metadata"] = {
+            k: v
+            for k, v in body.get("metadata", {}).items()
+            if k not in ("managedFields", "resourceVersion")
+        }
+        # No 404-to-NotFoundError translation, unlike ``patch``. An apply
+        # creates the object when it is absent, so a 404 here is a missing
+        # namespace or an unserved resource type -- never a missing object.
+        # Reporting it as NotFoundError would name the one thing it is not.
+        async with self.api.call_api(
+            "PATCH",
+            version=self.version,
+            url=f"{self.endpoint}/{self.name}",
+            namespace=self.namespace,
+            content=json.dumps(body),
+            # The API server takes a JSON body under this content type as
+            # readily as YAML, and JSON is what we already hold.
+            headers={"Content-Type": "application/apply-patch+yaml"},
+            params=params,
+        ) as resp:
+            result = resp.json()
+        if not dry_run:
+            self.raw = result
+        return result
+
     async def scale(self, replicas: int | None = None) -> None:
         """Scale this object in Kubernetes."""
         return await self.async_scale(replicas=replicas)
@@ -983,6 +1065,13 @@ class APIObjectSyncMixin(APIObject):
 
     def patch(self, patch, *, subresource=None, type=None) -> None:  # type: ignore[override]
         return as_sync_func(self.async_patch)(patch, subresource=subresource, type=type)
+
+    def apply(  # type: ignore[override]
+        self, *, field_manager: str, force: bool = False, dry_run: bool = False
+    ) -> dict:
+        return as_sync_func(self.async_apply)(
+            field_manager=field_manager, force=force, dry_run=dry_run
+        )
 
     def scale(self, replicas=None) -> None:  # type: ignore[override]
         return as_sync_func(self.async_scale)(replicas=replicas)

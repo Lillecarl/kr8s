@@ -91,6 +91,44 @@ await pod.patch(
 
 `````
 
+## Server-side apply a Pod
+
+Declare the whole {py:class}`Pod <kr8s.objects.Pod>` with {py:func}`Pod.apply() <kr8s.objects.Pod.apply()>` instead of describing a change to it. The API server records `field_manager` as the owner of every field the object sets, and removes the fields that manager stops setting.
+
+Unlike {py:func}`Pod.patch() <kr8s.objects.Pod.patch()>`, this creates the object when it does not exist yet.
+
+`````{tab-set}
+
+````{tab-item} Sync
+:sync: sync
+```python
+from kr8s.objects import Pod
+
+pod = Pod({
+    "metadata": {"name": "my-pod", "labels": {"foo": "bar"}},
+    "spec": {"containers": [{"name": "pause", "image": "registry.k8s.io/pause"}]},
+})
+pod.apply(field_manager="my-controller")
+```
+````
+
+````{tab-item} Async
+:sync: async
+```python
+from kr8s.asyncio.objects import Pod
+
+pod = await Pod({
+    "metadata": {"name": "my-pod", "labels": {"foo": "bar"}},
+    "spec": {"containers": [{"name": "pause", "image": "registry.k8s.io/pause"}]},
+})
+await pod.apply(field_manager="my-controller")
+```
+````
+
+`````
+
+Pass `force=True` to take a field that another manager owns; without it the API server answers `409`. Pass `dry_run=True` to ask what the merge would produce without storing it.
+
 ## Cordon a Node
 
 Cordon a {py:class}`Node <kr8s.objects.Node>` to mark it as unschedulable with {py:func}`Node.cordon() <kr8s.objects.Node.cordon()>`.

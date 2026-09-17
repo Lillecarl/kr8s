@@ -68,7 +68,7 @@ print(pod.annotations)
 
 ## Methods
 
-Objects also have helper methods like {py:func}`.patch() <kr8s.objects.APIObject.patch()>`, {py:func}`.exists() <kr8s.objects.APIObject.exists()>`, {py:func}`.refresh() <kr8s.objects.APIObject.refresh()>` and {py:func}`.delete() <kr8s.objects.APIObject.delete()>` for interacting with Kubernetes resources.
+Objects also have helper methods like {py:func}`.patch() <kr8s.objects.APIObject.patch()>`, {py:func}`.apply() <kr8s.objects.APIObject.apply()>`, {py:func}`.exists() <kr8s.objects.APIObject.exists()>`, {py:func}`.refresh() <kr8s.objects.APIObject.refresh()>` and {py:func}`.delete() <kr8s.objects.APIObject.delete()>` for interacting with Kubernetes resources.
 
 `````{tab-set}
 
@@ -341,7 +341,7 @@ CustomObject = new_class(
 
 `````
 
-The [](#kr8s.objects.APIObject) base class contains helper methods such as `.create()`, `.delete()`, `.patch()`, `.exists()`, etc.
+The [](#kr8s.objects.APIObject) base class contains helper methods such as `.create()`, `.delete()`, `.patch()`, `.apply()`, `.exists()`, etc.
 
 There are also optional helpers that can be enabled for resources that support them. For example you can enable `.scale()` for resources which support updating the number of replicas.
 

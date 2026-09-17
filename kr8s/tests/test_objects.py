@@ -18,7 +18,7 @@ import yaml
 import kr8s
 from kr8s._api import Api
 from kr8s._async_utils import anext
-from kr8s._exceptions import NotFoundError
+from kr8s._exceptions import NotFoundError, ServerError
 from kr8s._exec import CompletedExec, ExecError
 from kr8s.asyncio.objects import (
     APIObject,
@@ -612,6 +612,103 @@ async def test_patch_pod_json(example_pod_spec):
     )
     assert set(pod.labels) == {"patched"}
     await pod.delete()
+
+
+async def test_apply_pod(example_pod_spec):
+    pod = await Pod(example_pod_spec)
+    await pod.async_apply(field_manager="test-manager")
+    assert await pod.async_exists()
+    managers = {entry["manager"] for entry in pod.raw["metadata"]["managedFields"]}
+    assert "test-manager" in managers
+    await pod.delete()
+
+
+async def test_apply_removes_a_field_it_stops_declaring(example_pod_spec):
+    """The difference from a merge patch, which leaves the label behind
+    because it never says the field is gone."""
+    example_pod_spec["metadata"]["labels"]["temporary"] = "true"
+    pod = await Pod(example_pod_spec)
+    await pod.async_apply(field_manager="test-manager")
+    assert "temporary" in pod.labels
+
+    del example_pod_spec["metadata"]["labels"]["temporary"]
+    pod = await Pod(example_pod_spec)
+    await pod.async_apply(field_manager="test-manager")
+
+    assert "temporary" not in pod.labels
+    await pod.delete()
+
+
+async def test_apply_creates_an_absent_object(example_pod_spec):
+    """The defining difference from ``patch``, which answers 404. So a 404
+    from an apply means a missing namespace, never a missing object, and
+    must not be reported as NotFoundError."""
+    pod = await Pod(example_pod_spec)
+    assert not await pod.async_exists()
+
+    await pod.async_apply(field_manager="test-manager")
+
+    assert await pod.async_exists()
+    await pod.delete()
+
+
+async def test_apply_twice_over_the_same_object(example_pod_spec):
+    """The first apply replaces ``raw`` with the object the API server
+    returned, which carries ``metadata.managedFields`` and a
+    ``resourceVersion``. An apply configuration may carry neither: the first
+    is refused, and the second makes the apply an optimistic lock that a
+    write from anyone else breaks."""
+    pod = await Pod(example_pod_spec)
+    await pod.async_apply(field_manager="test-manager")
+    assert "managedFields" in pod.raw["metadata"]
+    assert "resourceVersion" in pod.raw["metadata"]
+
+    # Move the object on through a second handle, so the resourceVersion
+    # this one stored is stale -- what another writer does to it in the
+    # meantime.
+    other = await Pod.get(pod.name, namespace=pod.namespace)
+    await other.async_patch({"metadata": {"labels": {"bump": "1"}}})
+
+    await pod.async_apply(field_manager="test-manager")
+
+    assert await pod.async_exists()
+    await pod.delete()
+
+
+async def test_apply_dry_run_does_not_persist(example_pod_spec):
+    pod = await Pod(example_pod_spec)
+    result = await pod.async_apply(field_manager="test-manager", dry_run=True)
+
+    assert result["metadata"]["name"] == pod.name
+    assert not await pod.async_exists()
+
+
+async def test_apply_dry_run_leaves_raw_alone(example_pod_spec):
+    pod = await Pod(example_pod_spec)
+    await pod.async_apply(field_manager="test-manager")
+    before = copy.deepcopy(pod.raw)
+
+    await pod.async_apply(field_manager="test-manager", dry_run=True)
+
+    assert pod.raw == before
+    await pod.delete()
+
+
+async def test_apply_conflict_needs_force(example_pod_spec):
+    example_pod_spec["metadata"]["labels"]["owner"] = "first"
+    pod = await Pod(example_pod_spec)
+    await pod.async_apply(field_manager="first-manager")
+
+    example_pod_spec["metadata"]["labels"]["owner"] = "second"
+    contender = await Pod(example_pod_spec)
+    with pytest.raises(ServerError) as excinfo:
+        await contender.async_apply(field_manager="second-manager")
+    assert excinfo.value.response is not None
+    assert excinfo.value.response.status_code == 409
+
+    await contender.async_apply(field_manager="second-manager", force=True)
+    assert contender.labels["owner"] == "second"
+    await contender.delete()
 
 
 async def test_all_v1_objects_represented():
