@@ -378,8 +378,13 @@ class APIObject:
         *,
         validate: ValidateOption = "ignore",
         dry_run: DryRunOption = "none",
-    ) -> None:
-        """Create this object in Kubernetes."""
+    ) -> dict:
+        """Create this object in Kubernetes.
+
+        Returns:
+            The object as the API server stored it, or would have stored it
+            for a dry run.
+        """
         assert self.api
 
         params = {"fieldValidation": self._field_validation_header(validate)}
@@ -394,18 +399,20 @@ class APIObject:
             content=json.dumps(self.raw_template),
             params=params,
         ) as resp:
+            created = resp.json()
             # A dry run stores nothing, so keeping its answer would leave this
             # object holding a resourceVersion and a uid that no object has.
             if not dry_run_param:
-                self.raw = resp.json()
+                self.raw = created
             self._warn_server_response(resp)
+            return created
 
     async def create(
         self,
         *,
         validate: ValidateOption = "ignore",
         dry_run: DryRunOption = "none",
-    ) -> None:
+    ) -> dict:
         """Create this object in Kubernetes."""
         return await self.async_create(validate=validate, dry_run=dry_run)
 
@@ -416,7 +423,8 @@ class APIObject:
         force_conflicts: bool = False,
         validate: ValidateOption = "strict",
         dry_run: DryRunOption = "none",
-    ) -> None:
+        field_manager: str | None = None,
+    ) -> dict:
         """Create or update this object in Kubernetes using server-side apply.
 
         Args:
@@ -429,10 +437,17 @@ class APIObject:
                 apply would do, without storing it, so admission and
                 validation still run. ``self.raw`` is left alone, because a
                 dry run stores nothing to describe.
+            field_manager: Own the fields as this manager, instead of the one
+                bound to the API client. A caller that applies objects under
+                several managers cannot express that with the binding alone.
+
+        Returns:
+            The object as the API server merged it. For a dry run this is the
+            only way to see the result, since nothing is stored.
 
         Example:
             >>> deployment = await Deployment.get("my-deployment")
-            >>> await deployment.async_apply(dry_run="server")
+            >>> merged = await deployment.async_apply(dry_run="server")
         """
         assert self.api
         # `managedFields` must be nil in an apply body. Drop it from a copy
@@ -449,13 +464,15 @@ class APIObject:
         dry_run_param = _dry_run_param(dry_run)
         if dry_run_param:
             params["dryRun"] = dry_run_param
-        # fieldManager
-        if self.api.field_manager:
-            field_manager = self.api.field_manager
-        elif server_side:
-            field_manager = "kr8s"
-        else:
-            field_manager = "kr8s-client-side-apply"
+        # fieldManager: the argument wins over the client-wide binding, so a
+        # caller can apply different objects under different managers.
+        if field_manager is None:
+            if self.api.field_manager:
+                field_manager = self.api.field_manager
+            elif server_side:
+                field_manager = "kr8s"
+            else:
+                field_manager = "kr8s-client-side-apply"
         params["fieldManager"] = field_manager
 
         # validate
@@ -481,15 +498,17 @@ class APIObject:
                 headers={"Content-Type": _apply_op_content_type(op_type)},
                 params=params,
             ) as resp:
+                merged = resp.json()
                 if not dry_run_param:
-                    self.raw = resp.json()
+                    self.raw = merged
                 self._warn_server_response(resp)
+                return merged
         except ServerError as e:
             if e.response and e.response.status_code == 404:
                 # The object does not exist yet, so the apply becomes a
                 # create. `dry_run` has to come with it, or a dry run of an
                 # apply that creates would create for real.
-                await self.async_create(validate=validate, dry_run=dry_run)
+                return await self.async_create(validate=validate, dry_run=dry_run)
             else:
                 raise
 
@@ -514,13 +533,15 @@ class APIObject:
         force_conflicts: bool = False,
         validate: ValidateOption = "strict",
         dry_run: DryRunOption = "none",
-    ) -> None:
+        field_manager: str | None = None,
+    ) -> dict:
         """Create or update this object in Kubernetes using server-side apply."""
         return await self.async_apply(
             server_side=server_side,
             force_conflicts=force_conflicts,
             validate=validate,
             dry_run=dry_run,
+            field_manager=field_manager,
         )
 
     async def delete(
@@ -1142,12 +1163,14 @@ class APIObjectSyncMixin(APIObject):
         force_conflicts: bool = False,
         validate: ValidateOption = "strict",
         dry_run: DryRunOption = "none",
+        field_manager: str | None = None,
     ):
         return as_sync_func(self.async_apply)(
             server_side=server_side,
             force_conflicts=force_conflicts,
             validate=validate,
             dry_run=dry_run,
+            field_manager=field_manager,
         )
 
     def delete(  # type: ignore[override]

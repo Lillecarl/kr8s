@@ -616,6 +616,34 @@ async def test_apply_creates_if_not_exists(example_pod_spec):
     assert await pod.exists(), "Pod should exist after creation"
 
 
+async def test_apply_takes_a_field_manager_per_call(example_pod_spec):
+    """The client-wide binding cannot express a caller that applies objects
+    under several managers in one run, so the argument overrides it."""
+    api = await kr8s.asyncio.api(field_manager="bound-to-the-client")
+    pod = await Pod(example_pod_spec, api=api)
+
+    await pod.apply(server_side=True, field_manager="per-call")
+
+    managers = {e["manager"] for e in pod.raw["metadata"]["managedFields"]}
+    assert "per-call" in managers
+    assert "bound-to-the-client" not in managers
+    await pod.delete()
+
+
+async def test_apply_returns_the_merged_object(example_pod_spec):
+    """A dry run stores nothing, so what it returns is the only way to see
+    the result. `ekn clusterdiff` is built on exactly this."""
+    pod = await Pod(example_pod_spec)
+
+    merged = await pod.apply(server_side=True, dry_run="server")
+
+    assert merged["metadata"]["name"] == pod.name
+    # Defaulted by the API server, so it proves the answer came from there
+    # rather than being the object we sent.
+    assert merged["spec"]["restartPolicy"]
+    assert not await pod.exists()
+
+
 async def test_a_failed_apply_leaves_managed_fields_alone(example_pod_spec):
     """The apply body is built from a copy, so a request that never succeeds
     does not leave the caller's object stripped of a field it had."""
