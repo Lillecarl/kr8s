@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, patch
 
 import anyio
 import pytest
+import yaml
 from packaging.version import parse as parse_version
 
 import kr8s
@@ -524,6 +525,38 @@ async def test_create(example_pod_spec, example_service_spec):
     assert await service.exists(), "Service should exist after creation"
     await pod.delete()
     await service.delete()
+
+
+async def test_create_uses_the_api_it_is_given(example_pod_spec, k8s_cluster):
+    """`kr8s.create(resources, api=...)` sends through the api it is given.
+
+    It used to send through `resource.api` instead, so the argument decided
+    nothing. With two clusters that is a silent write to the wrong one.
+    """
+    # Bind the pod first: `api()` with no arguments returns whatever is
+    # already cached, so creating `other` first would bind the pod to it and
+    # the test would prove nothing.
+    pod = await Pod(example_pod_spec)
+    kubeconfig = yaml.safe_load(k8s_cluster.kubeconfig_path.read_text())
+    other = await kr8s.asyncio.api(context=kubeconfig["current-context"])
+    assert pod.api is not other, "the pod must be bound to a different api"
+
+    calls = []
+    real = other.call_api
+
+    def recording(*args, **kwargs):
+        calls.append(kwargs.get("method", args[0] if args else None))
+        return real(*args, **kwargs)
+
+    other.call_api = recording
+    try:
+        await kr8s.asyncio.create([pod], api=other)
+    finally:
+        other.call_api = real
+
+    assert "POST" in calls, f"create() did not use the api it was given; calls={calls}"
+    assert await pod.exists()
+    await pod.delete()
 
 
 def test_create_sync(example_pod_spec, example_service_spec):
