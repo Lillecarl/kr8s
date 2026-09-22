@@ -20,7 +20,7 @@ from kr8s._constants import (
     KUBERNETES_MINIMUM_SUPPORTED_VERSION,
 )
 from kr8s._exceptions import APITimeoutError, ExecError
-from kr8s.asyncio.objects import Pod, Service, Table
+from kr8s.asyncio.objects import Pod, Service, Table, new_class
 from kr8s.objects import Pod as SyncPod
 from kr8s.objects import Service as SyncService
 
@@ -403,35 +403,59 @@ async def test_api_timeout() -> None:
 async def test_lookup_kind():
     api = await kr8s.asyncio.api()
 
-    assert await api.lookup_kind("no") == ("node/v1", "nodes", False)
-    assert await api.lookup_kind("nodes") == ("node/v1", "nodes", False)
-    assert await api.lookup_kind("po") == ("pod/v1", "pods", True)
-    assert await api.lookup_kind("pods/v1") == ("pod/v1", "pods", True)
+    assert await api.lookup_kind("no") == ("Node/v1", "nodes", False)
+    assert await api.lookup_kind("nodes") == ("Node/v1", "nodes", False)
+    assert await api.lookup_kind("po") == ("Pod/v1", "pods", True)
+    assert await api.lookup_kind("pods/v1") == ("Pod/v1", "pods", True)
     assert await api.lookup_kind("CSIStorageCapacity") == (
-        "csistoragecapacity.storage.k8s.io/v1",
+        "CSIStorageCapacity.storage.k8s.io/v1",
         "csistoragecapacities",
         True,
     )
     assert await api.lookup_kind("role") == (
-        "role.rbac.authorization.k8s.io/v1",
+        "Role.rbac.authorization.k8s.io/v1",
         "roles",
         True,
     )
     assert await api.lookup_kind("roles") == (
-        "role.rbac.authorization.k8s.io/v1",
+        "Role.rbac.authorization.k8s.io/v1",
         "roles",
         True,
     )
     assert await api.lookup_kind("roles.v1.rbac.authorization.k8s.io") == (
-        "role.rbac.authorization.k8s.io/v1",
+        "Role.rbac.authorization.k8s.io/v1",
         "roles",
         True,
     )
     assert await api.lookup_kind("roles.rbac.authorization.k8s.io") == (
-        "role.rbac.authorization.k8s.io/v1",
+        "Role.rbac.authorization.k8s.io/v1",
         "roles",
         True,
     )
+
+
+async def test_unknown_kind_keeps_its_case(example_crd, ensure_gc):
+    """A kind kr8s has no class for still reports the Kind the server serves.
+
+    `ensure_gc` because `new_class` registers the class it builds as an
+    `APIObject` subclass, and `get_class` walks those. A Shirt left behind
+    here answers a later test's lookup.
+    """
+    api = await kr8s.asyncio.api()
+
+    # Uncached: a CRD created after the cache was filled is not in it.
+    kind, plural, namespaced = await api.async_lookup_kind("shirt", skip_cache=True)
+    assert (kind, plural, namespaced) == (
+        "Shirt.stable.example.com/v1",
+        "shirts",
+        True,
+    )
+
+    # The class `async_get_kind` builds for a kind with no builtin class.
+    shirt = new_class(kind, namespaced=namespaced, plural=plural)
+    assert shirt.kind == "Shirt"
+    assert shirt.version == "stable.example.com/v1"
+    del shirt
 
 
 async def test_nonexisting_resource_type():

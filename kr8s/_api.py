@@ -399,14 +399,19 @@ class Api:
                 or kind == resource["singularName"]
                 or ("shortNames" in resource and kind in resource["shortNames"])
             ):
+                # The Kind, not the singular name. `new_class` builds a class
+                # straight out of this string, so a lowercase singular here
+                # becomes the class's `kind` and every object of a kind kr8s
+                # has no builtin class for reports a lowercase `.kind`.
+                # `parse_kind` lowercases, so `get_class` is unaffected.
                 if "/" in resource["version"]:
                     return (
-                        f"{resource['singularName']}.{resource['version']}",
+                        f"{resource['kind']}.{resource['version']}",
                         resource["name"],
                         resource["namespaced"],
                     )
                 return (
-                    f"{resource['singularName']}/{resource['version']}",
+                    f"{resource['kind']}/{resource['version']}",
                     resource["name"],
                     resource["namespaced"],
                 )
