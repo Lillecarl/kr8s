@@ -5,6 +5,7 @@ import datetime
 import inspect
 import pathlib
 import platform
+import socket
 import tempfile
 import time
 from contextlib import suppress
@@ -923,6 +924,33 @@ async def test_multiple_bind_addresses_port_forward(nginx_service):
 
     # Stop the port forwarding
     await pf.stop()
+
+
+@pytest.mark.skipif(
+    "macOS" in platform.platform(),
+    reason="Only 127.0.0.1 is bound by default on macOS, see https://github.com/kr8s-org/kr8s/issues/380",
+)
+async def test_port_forward_closes_every_bind_address():
+    def bound(port):
+        listening = []
+        for address in addresses:
+            with socket.socket() as probe:
+                probe.settimeout(5)
+                if probe.connect_ex((address, port)) == 0:
+                    listening.append(address)
+        return listening
+
+    addresses = ["127.0.0.1", "127.0.0.2"]
+    # Never awaited, so it never binds an api: `_run` makes no API request and
+    # contacts no Pod, it only opens and closes the local listeners.
+    pod = Pod({"metadata": {"name": "nonexistent"}})
+    pf = PortForward(pod, 80, local_port="auto", address=addresses)
+
+    async with pf._run() as port:
+        assert bound(port) == addresses
+
+    assert bound(port) == []
+    assert pf.servers == []
 
 
 async def test_scalable_dot_notation():
