@@ -293,20 +293,27 @@ class APIObject:
         while start + timeout > time.time():
             if name:
                 try:
+                    # No `field_selector={"metadata.name": name}`. Passing one
+                    # forces `async_get` onto the collection, and reading the
+                    # collection needs the `list` verb where the resource's
+                    # own URL needs only `get`. `async_get` narrows by name on
+                    # its own. See #680.
                     resources = [
                         resource
                         async for resource in api.async_get(
                             cls,
                             name,
                             namespace=namespace,
-                            field_selector={"metadata.name": name},
                             **kwargs,
                         )
                     ]
                 except ServerError as e:
                     if e.response and e.response.status_code == 404:
-                        continue
-                    raise e
+                        # Not `continue`: that skips the backoff below and
+                        # spins on the API server until `timeout` expires.
+                        resources = []
+                    else:
+                        raise e
             elif label_selector or field_selector:
                 resources = [
                     resource

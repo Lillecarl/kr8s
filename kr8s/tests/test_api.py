@@ -222,6 +222,35 @@ async def test_get_pods(namespace) -> None:
     assert isinstance(pods[0], Pod)
 
 
+async def test_get_by_name_does_not_need_list(
+    example_pod_spec, ns, get_only_serviceaccount
+) -> None:
+    """Getting one Pod by name must ask for `get`, not `list`.
+
+    The `pytest-get-only` service account is granted `get` on Pods and
+    nothing else. See https://github.com/kr8s-org/kr8s/issues/680.
+    """
+    pod = await Pod(example_pod_spec)
+    await pod.create()
+    # `kubeconfig` has to be pointed away, or the KUBECONFIG the test session
+    # exports wins and the api is the cluster admin. See `test_service_account`.
+    api = await kr8s.asyncio.api(
+        serviceaccount=get_only_serviceaccount, kubeconfig="/no/file/here"
+    )
+
+    # Through the class and through the api, by name.
+    assert (await Pod.get(pod.name, namespace=ns, api=api)).name == pod.name
+    [found] = [p async for p in api.get("pods", pod.name, namespace=ns)]
+    assert found.name == pod.name
+
+    # Listing the collection is what this account may not do, and still may not.
+    with pytest.raises(kr8s.ServerError):
+        [p async for p in api.get("pods", namespace=ns)]
+
+    # A name that matches nothing is still an empty iterator, not a 404.
+    assert [p async for p in api.get("pods", "does-not-exist", namespace=ns)] == []
+
+
 async def test_get_custom_resouces(example_crd) -> None:
     async for shirt in kr8s.asyncio.get(example_crd.name):
         assert shirt

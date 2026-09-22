@@ -426,9 +426,15 @@ class Api:
         params: dict | None = None,
         watch: bool = False,
         allow_unknown_type: bool = True,
+        name: str | None = None,
         **kwargs,
     ) -> AsyncGenerator[tuple[type[APIObject], httpx.Response]]:
-        """Get a Kubernetes resource."""
+        """Get a Kubernetes resource.
+
+        Passing ``name`` requests that one resource by its own URL rather
+        than the collection, so the response is a single object and not a
+        list.
+        """
         from ._objects import get_class, new_class
 
         if not namespace:
@@ -477,7 +483,7 @@ class Api:
         params = params or None
         async with self.call_api(
             method="GET",
-            url=obj_cls.endpoint,
+            url=f"{obj_cls.endpoint}/{name}" if name else obj_cls.endpoint,
             version=obj_cls.version,
             namespace=namespace if obj_cls.namespaced else None,
             params=params,
@@ -566,7 +572,20 @@ class Api:
         **kwargs,
     ) -> AsyncGenerator[APIObject | dict]:
 
-        if name is not None:
+        # A named resource has a URL of its own, and reading it asks the API
+        # server for the `get` verb. Filtering the collection by
+        # `metadata.name` asks for `list`, which is a wider grant than the
+        # caller wants -- see #680. Anything that really is a list keeps the
+        # collection: a selector still has to be applied, and `kr8s.ALL` has
+        # no single URL for a namespaced kind.
+        single = (
+            name is not None
+            and not label_selector
+            and not field_selector
+            and namespace is not ALL
+        )
+
+        if name is not None and not single:
             # Normalized field_selector to a string
             field_selector_str: str
             if isinstance(field_selector, dict):
@@ -585,46 +604,61 @@ class Api:
             headers["Accept"] = (
                 f"application/json;as={as_object.kind};v={version};g={group}"
             )
-        else:
+        elif not single:
             params["limit"] = 100
         while continue_paging:
-            async with self.async_get_kind(
-                kind,
-                namespace=namespace,
-                label_selector=label_selector,
-                field_selector=field_selector,
-                headers=headers or None,
-                allow_unknown_type=allow_unknown_type,
-                params=params,
-                **kwargs,
-            ) as (obj_cls, response):
-                resourcelist = response.json()
-                if (
-                    as_object
-                    and "kind" in resourcelist
-                    and resourcelist["kind"] == as_object.kind
-                ):
-                    if raw:
-                        yield resourcelist
+            try:
+                async with self.async_get_kind(
+                    kind,
+                    name=name if single else None,
+                    namespace=namespace,
+                    label_selector=label_selector,
+                    field_selector=field_selector,
+                    headers=headers or None,
+                    allow_unknown_type=allow_unknown_type,
+                    params=params,
+                    **kwargs,
+                ) as (obj_cls, response):
+                    resourcelist = response.json()
+                    if (
+                        as_object
+                        and "kind" in resourcelist
+                        and resourcelist["kind"] == as_object.kind
+                    ):
+                        if raw:
+                            yield resourcelist
+                        else:
+                            yield as_object(resourcelist, api=self)
+                    elif single:
+                        if raw:
+                            yield resourcelist
+                        else:
+                            yield obj_cls(resourcelist, api=self)
                     else:
-                        yield as_object(resourcelist, api=self)
-                else:
-                    if "items" in resourcelist:
-                        for item in resourcelist["items"]:
-                            if name is None or item["metadata"]["name"] == name:
-                                if raw:
-                                    yield item
-                                else:
-                                    yield obj_cls(item, api=self)
-                if (
-                    "metadata" in resourcelist
-                    and "continue" in resourcelist["metadata"]
-                    and resourcelist["metadata"]["continue"]
-                ):
-                    continue_paging = True
-                    params["continue"] = resourcelist["metadata"]["continue"]
-                else:
-                    continue_paging = False
+                        if "items" in resourcelist:
+                            for item in resourcelist["items"]:
+                                if name is None or item["metadata"]["name"] == name:
+                                    if raw:
+                                        yield item
+                                    else:
+                                        yield obj_cls(item, api=self)
+                    if (
+                        "metadata" in resourcelist
+                        and "continue" in resourcelist["metadata"]
+                        and resourcelist["metadata"]["continue"]
+                    ):
+                        continue_paging = True
+                        params["continue"] = resourcelist["metadata"]["continue"]
+                    else:
+                        continue_paging = False
+            except ServerError as e:
+                # A name that matches nothing has always given an empty
+                # iterator. On the collection that is an empty `items`; on
+                # the resource's own URL it is a 404. Every other status,
+                # 403 included, still raises, and so does a 404 from a list.
+                if single and e.response is not None and e.response.status_code == 404:
+                    return
+                raise
 
     async def watch(
         self,
