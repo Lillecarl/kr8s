@@ -196,11 +196,13 @@ class PortForward:
             yield self.local_port
 
         finally:
-            # Ensure all servers are closed properly
-            for server in self.servers:
+            # Take the list away before closing, rather than removing each
+            # server as it closes: removing from the list being iterated skips
+            # every second entry, and a skipped server stays bound.
+            servers, self.servers = self.servers, []
+            for server in servers:
                 server.close()
                 await server.wait_closed()
-                self.servers.remove(server)
 
     async def _select_pod(self) -> APIObject:
         """Select a Pod to forward to."""

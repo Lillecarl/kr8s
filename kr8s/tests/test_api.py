@@ -11,23 +11,51 @@ from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, patch
 
 import anyio
+import httpx
 import pytest
+import yaml
 from packaging.version import parse as parse_version
 
 import kr8s
 import kr8s.asyncio
+from kr8s._api import _server_error
 from kr8s._async_utils import anext
 from kr8s._constants import (
     KUBERNETES_MAXIMUM_SUPPORTED_VERSION,
     KUBERNETES_MINIMUM_SUPPORTED_VERSION,
 )
 from kr8s._exceptions import APITimeoutError, ExecError, ServerError
-from kr8s.asyncio.objects import Pod, Service, Table
+from kr8s.asyncio.objects import Pod, Service, Table, new_class
 from kr8s.objects import Pod as SyncPod
 from kr8s.objects import Service as SyncService
 
 if sys.version_info < (3, 11):
     from exceptiongroup import BaseExceptionGroup
+
+
+@pytest.mark.parametrize(
+    "status_code, body, message, status_type",
+    [
+        (409, {"kind": "Status", "message": "already exists"}, "already exists", dict),
+        (500, {"kind": "Status", "message": "webhook denied"}, "webhook denied", dict),
+        (502, "<html>Bad Gateway</html>", "boom", str),
+        (503, "", "boom", str),
+        (500, {"kind": "Status", "reason": "InternalError"}, "boom", str),
+    ],
+)
+def test_server_error_reads_the_body_whatever_the_status_class(
+    status_code, body, message, status_type
+):
+    kwargs = {"json": body} if isinstance(body, dict) else {"text": body}
+    response = httpx.Response(
+        status_code,
+        request=httpx.Request("GET", "https://kubernetes/api/v1"),
+        **kwargs,
+    )
+    error = httpx.HTTPStatusError("boom", request=response.request, response=response)
+    translated = _server_error(error)
+    assert str(translated) == message
+    assert isinstance(translated.status, status_type)
 
 
 @pytest.mark.parametrize("httpx_ws_version, unwrap", [("0.8", False), ("0.9", True)])
@@ -161,6 +189,46 @@ async def test_api_factory_with_kubeconfig(k8s_cluster, serviceaccount) -> None:
     assert p3.api is not k2
 
 
+async def test_the_factory_checks_the_version_once():
+    """`api()` returns a cached Api and awaits it again, so the check has to
+    be per instance rather than per await. It costs a `/version` request, and
+    a caller that asks for an Api per operation used to pay one every time."""
+    api = await kr8s.asyncio.api()
+    keep = api.async_version
+    calls = 0
+
+    async def counting_version():
+        nonlocal calls
+        calls += 1
+        return await keep()
+
+    api.async_version = counting_version
+    try:
+        for _ in range(3):
+            again = await kr8s.asyncio.api()
+            assert again is api
+    finally:
+        api.async_version = keep
+
+    assert calls == 0, "a cached Api re-ran the version check"
+
+
+async def test_a_failed_first_await_is_not_cached_as_ready():
+    """`_ready` is set after the work, not before it, so authentication that
+    fails is retried rather than remembered as done."""
+    api = await kr8s.asyncio.api()
+    api._ready = False
+    boom = RuntimeError("the credentials are not there yet")
+
+    with patch.object(api, "_check_version", side_effect=boom):
+        with pytest.raises(RuntimeError, match="not there yet"):
+            await api
+
+    assert api._ready is False
+    await api
+    assert api._ready is True
+
+
 def test_version_sync():
     api = kr8s.api()
     version = api.version()
@@ -222,6 +290,35 @@ async def test_get_pods(namespace) -> None:
     assert isinstance(pods, list)
     assert len(pods) > 0
     assert isinstance(pods[0], Pod)
+
+
+async def test_get_by_name_does_not_need_list(
+    example_pod_spec, ns, get_only_serviceaccount
+) -> None:
+    """Getting one Pod by name must ask for `get`, not `list`.
+
+    The `pytest-get-only` service account is granted `get` on Pods and
+    nothing else. See https://github.com/kr8s-org/kr8s/issues/680.
+    """
+    pod = await Pod(example_pod_spec)
+    await pod.create()
+    # `kubeconfig` has to be pointed away, or the KUBECONFIG the test session
+    # exports wins and the api is the cluster admin. See `test_service_account`.
+    api = await kr8s.asyncio.api(
+        serviceaccount=get_only_serviceaccount, kubeconfig="/no/file/here"
+    )
+
+    # Through the class and through the api, by name.
+    assert (await Pod.get(pod.name, namespace=ns, api=api)).name == pod.name
+    [found] = [p async for p in api.get("pods", pod.name, namespace=ns)]
+    assert found.name == pod.name
+
+    # Listing the collection is what this account may not do, and still may not.
+    with pytest.raises(kr8s.ServerError):
+        [p async for p in api.get("pods", namespace=ns)]
+
+    # A name that matches nothing is still an empty iterator, not a 404.
+    assert [p async for p in api.get("pods", "does-not-exist", namespace=ns)] == []
 
 
 async def test_get_custom_resouces(example_crd) -> None:
@@ -405,35 +502,84 @@ async def test_api_timeout() -> None:
 async def test_lookup_kind():
     api = await kr8s.asyncio.api()
 
-    assert await api.lookup_kind("no") == ("node/v1", "nodes", False)
-    assert await api.lookup_kind("nodes") == ("node/v1", "nodes", False)
-    assert await api.lookup_kind("po") == ("pod/v1", "pods", True)
-    assert await api.lookup_kind("pods/v1") == ("pod/v1", "pods", True)
+    assert await api.lookup_kind("no") == ("Node/v1", "nodes", False)
+    assert await api.lookup_kind("nodes") == ("Node/v1", "nodes", False)
+    assert await api.lookup_kind("po") == ("Pod/v1", "pods", True)
+    assert await api.lookup_kind("pods/v1") == ("Pod/v1", "pods", True)
     assert await api.lookup_kind("CSIStorageCapacity") == (
-        "csistoragecapacity.storage.k8s.io/v1",
+        "CSIStorageCapacity.storage.k8s.io/v1",
         "csistoragecapacities",
         True,
     )
     assert await api.lookup_kind("role") == (
-        "role.rbac.authorization.k8s.io/v1",
+        "Role.rbac.authorization.k8s.io/v1",
         "roles",
         True,
     )
     assert await api.lookup_kind("roles") == (
-        "role.rbac.authorization.k8s.io/v1",
+        "Role.rbac.authorization.k8s.io/v1",
         "roles",
         True,
     )
     assert await api.lookup_kind("roles.v1.rbac.authorization.k8s.io") == (
-        "role.rbac.authorization.k8s.io/v1",
+        "Role.rbac.authorization.k8s.io/v1",
         "roles",
         True,
     )
     assert await api.lookup_kind("roles.rbac.authorization.k8s.io") == (
-        "role.rbac.authorization.k8s.io/v1",
+        "Role.rbac.authorization.k8s.io/v1",
         "roles",
         True,
     )
+
+
+async def test_lookup_kind_with_a_hyphenated_singular(example_crd_spec):
+    """A CRD whose singular is not the lowercased Kind.
+
+    `parse_kind` lowercases, so `NetworkAttachmentDefinition` matches none
+    of the plural, the singular or the short names. Only a case-folded
+    compare against the Kind itself finds it. Hyphenated singulars are legal
+    and common in the CNI ecosystem.
+    """
+    spec = copy.deepcopy(example_crd_spec)
+    spec["metadata"]["name"] = "network-attachment-definitions.stable.example.com"
+    spec["spec"]["names"] = {
+        "plural": "network-attachment-definitions",
+        "singular": "network-attachment-definition",
+        "kind": "NetworkAttachmentDefinition",
+    }
+
+    async with create_delete_crd(spec):
+        api = await kr8s.asyncio.api()
+        assert await api.lookup_kind("NetworkAttachmentDefinition") == (
+            "NetworkAttachmentDefinition.stable.example.com/v1",
+            "network-attachment-definitions",
+            True,
+        )
+
+
+async def test_unknown_kind_keeps_its_case(example_crd, ensure_gc):
+    """A kind kr8s has no class for still reports the Kind the server serves.
+
+    `ensure_gc` because `new_class` registers the class it builds as an
+    `APIObject` subclass, and `get_class` walks those. A Shirt left behind
+    here answers a later test's lookup.
+    """
+    api = await kr8s.asyncio.api()
+
+    # Uncached: a CRD created after the cache was filled is not in it.
+    kind, plural, namespaced = await api.async_lookup_kind("shirt", skip_cache=True)
+    assert (kind, plural, namespaced) == (
+        "Shirt.stable.example.com/v1",
+        "shirts",
+        True,
+    )
+
+    # The class `async_get_kind` builds for a kind with no builtin class.
+    shirt = new_class(kind, namespaced=namespaced, plural=plural)
+    assert shirt.kind == "Shirt"
+    assert shirt.version == "stable.example.com/v1"
+    del shirt
 
 
 async def test_nonexisting_resource_type():
@@ -442,6 +588,34 @@ async def test_nonexisting_resource_type():
     with pytest.raises(ValueError):
         async for _ in api.get("foo.bar.baz/v1"):
             pass
+
+
+async def test_get_an_unknown_kind_when_discovery_fails():
+    """A discovery error leaves `lookup_kind` without a plural.
+
+    `async_get_kind` warns and carries on, so what follows has to work with
+    what it has. It used to read a `plural` that the failed lookup never
+    assigned, and raise `UnboundLocalError` from inside the warning path.
+    That is not a ServerError, so a caller guarding against one did not
+    catch it either.
+
+    The call still cannot succeed -- without discovery there is no API
+    group to address -- but it now reaches kr8s' own error for that, which
+    says so.
+
+    The kind does not have to exist. The patched lookup raises before
+    anything consults the cluster, so the name is only a string.
+    """
+    api = await kr8s.asyncio.api()
+    boom = ServerError("the server is currently unable to handle the request")
+
+    with patch.object(api, "async_lookup_kind", side_effect=boom):
+        with pytest.warns(UserWarning, match="unable to handle"):
+            with pytest.raises(ValueError, match="Unknown API version"):
+                async for _ in api.async_get(
+                    "shirts.stable.example.com", namespace=kr8s.ALL
+                ):
+                    pass
 
 
 @pytest.mark.parametrize(
@@ -526,6 +700,76 @@ async def test_create(example_pod_spec, example_service_spec):
     assert await service.exists(), "Service should exist after creation"
     await pod.delete()
     await service.delete()
+
+
+async def test_create_uses_the_api_it_is_given(example_pod_spec, k8s_cluster):
+    """`kr8s.create(resources, api=...)` sends through the api it is given.
+
+    It used to send through `resource.api` instead, so the argument decided
+    nothing. With two clusters that is a silent write to the wrong one.
+    """
+    # Bind the pod first: `api()` with no arguments returns whatever is
+    # already cached, so creating `other` first would bind the pod to it and
+    # the test would prove nothing.
+    pod = await Pod(example_pod_spec)
+    kubeconfig = yaml.safe_load(k8s_cluster.kubeconfig_path.read_text())
+    other = await kr8s.asyncio.api(context=kubeconfig["current-context"])
+    assert pod.api is not other, "the pod must be bound to a different api"
+
+    calls = []
+    real = other.call_api
+
+    def recording(*args, **kwargs):
+        calls.append(kwargs.get("method", args[0] if args else None))
+        return real(*args, **kwargs)
+
+    other.call_api = recording
+    try:
+        await kr8s.asyncio.create([pod], api=other)
+    finally:
+        other.call_api = real
+
+    assert "POST" in calls, f"create() did not use the api it was given; calls={calls}"
+    assert await pod.exists()
+    await pod.delete()
+
+
+async def test_create_without_an_api_keeps_the_objects_binding(
+    example_pod_spec, k8s_cluster
+):
+    """With no `api` argument, each resource is sent through the api it is
+    bound to, so `create([obj])` and `obj.create()` reach the same cluster.
+
+    Resolving a default here and sending everything through that would move
+    an object that was explicitly given an api of its own.
+    """
+    # `api()` with no arguments returns the first cached instance, so take
+    # that one first: `bound` must not be the api the helper would resolve,
+    # or forcing the resolved one would look identical to honouring the
+    # binding and this would pass either way.
+    default = await kr8s.asyncio.api()
+    kubeconfig = yaml.safe_load(k8s_cluster.kubeconfig_path.read_text())
+    bound = await kr8s.asyncio.api(context=kubeconfig["current-context"])
+    assert bound is not default
+
+    pod = await Pod(example_pod_spec, api=bound)
+    assert pod.api is bound
+
+    calls = []
+    real = bound.call_api
+
+    def recording(*args, **kwargs):
+        calls.append(kwargs.get("method", args[0] if args else None))
+        return real(*args, **kwargs)
+
+    bound.call_api = recording
+    try:
+        await kr8s.asyncio.create([pod])
+    finally:
+        bound.call_api = real
+
+    assert "POST" in calls, f"create() did not use the pod's own api; calls={calls}"
+    await pod.delete()
 
 
 def test_create_sync(example_pod_spec, example_service_spec):

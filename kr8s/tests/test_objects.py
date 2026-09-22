@@ -5,6 +5,7 @@ import datetime
 import inspect
 import pathlib
 import platform
+import socket
 import tempfile
 import time
 from contextlib import suppress
@@ -23,6 +24,7 @@ from kr8s._exec import CompletedExec, ExecError
 from kr8s.asyncio.objects import (
     APIObject,
     ConfigMap,
+    CustomResourceDefinition,
     Deployment,
     Ingress,
     Node,
@@ -186,6 +188,26 @@ async def test_pod_wait_ready(example_pod_spec):
     await pod.delete(grace_period=10)
     await pod.wait("condition=Ready=False")
     await pod.wait("delete")
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        None,
+        # A CustomResourceDefinition the API server has accepted but not
+        # yet given conditions reports this shape, not an empty list.
+        {"conditions": None},
+        {},
+        {"conditions": []},
+    ],
+)
+async def test_conditions_are_unmet_while_the_status_is_empty(example_pod_spec, status):
+    pod = await Pod(example_pod_spec)
+    if status is None:
+        pod.raw.pop("status", None)
+    else:
+        pod.raw["status"] = status
+    assert not await pod._test_conditions(["condition=Established"])
 
 
 async def test_pod_missing_await_error(example_pod_spec):
@@ -940,6 +962,33 @@ async def test_multiple_bind_addresses_port_forward(nginx_service):
     await pf.stop()
 
 
+@pytest.mark.skipif(
+    "macOS" in platform.platform(),
+    reason="Only 127.0.0.1 is bound by default on macOS, see https://github.com/kr8s-org/kr8s/issues/380",
+)
+async def test_port_forward_closes_every_bind_address():
+    def bound(port):
+        listening = []
+        for address in addresses:
+            with socket.socket() as probe:
+                probe.settimeout(5)
+                if probe.connect_ex((address, port)) == 0:
+                    listening.append(address)
+        return listening
+
+    addresses = ["127.0.0.1", "127.0.0.2"]
+    # Never awaited, so it never binds an api: `_run` makes no API request and
+    # contacts no Pod, it only opens and closes the local listeners.
+    pod = Pod({"metadata": {"name": "nonexistent"}})
+    pf = PortForward(pod, 80, local_port="auto", address=addresses)
+
+    async with pf._run() as port:
+        assert bound(port) == addresses
+
+    assert bound(port) == []
+    assert pf.servers == []
+
+
 async def test_scalable_dot_notation():
     class Foo(APIObject):
         version = "foo.kr8s.org/v1alpha1"
@@ -1010,8 +1059,54 @@ async def test_objects_from_files_nested():
 
 async def test_custom_object_from_file():
     simple_dir = CURRENT_DIR / "resources" / "custom" / "evc.yaml"
-    objects = await objects_from_files(simple_dir)
+    # No CustomResourceDefinition serves this kind, so the scope and plural
+    # cannot be resolved and the guess stands.
+    with pytest.warns(UserWarning, match="ephemeralvolumeclaim"):
+        objects = await objects_from_files(simple_dir)
     assert len(objects) == 1
+
+
+async def test_custom_object_from_file_reads_its_scope(example_crd_spec, tmp_path):
+    """A cluster-scoped custom resource is loaded as cluster-scoped.
+
+    `new_class` alone has to assume namespaced, and has to guess the plural
+    as the kind plus an "s". Both are wrong here, and both are answered by
+    the API server's own discovery document.
+    """
+    api = await kr8s.asyncio.api()
+    spec = copy.deepcopy(example_crd_spec)
+    spec["metadata"]["name"] = "fezzes.stable.example.com"
+    spec["spec"]["scope"] = "Cluster"
+    spec["spec"]["names"] = {"plural": "fezzes", "singular": "fez", "kind": "Fez"}
+    crd = await CustomResourceDefinition(spec)
+    await crd.create()
+    try:
+        # Established is not enough: the group's discovery endpoint answers
+        # 404 for a moment after the CustomResourceDefinition is accepted.
+        with anyio.fail_after(60):
+            while True:
+                with suppress(ValueError, kr8s.ServerError):
+                    await api.async_lookup_kind("Fez.stable.example.com/v1")
+                    break
+                await anyio.sleep(0.1)
+
+        manifest = tmp_path / "fez.yaml"
+        manifest.write_text(
+            yaml.dump(
+                {
+                    "apiVersion": "stable.example.com/v1",
+                    "kind": "Fez",
+                    "metadata": {"name": "red"},
+                }
+            )
+        )
+        [fez] = await objects_from_files(manifest)
+        assert fez.kind == "Fez"
+        assert fez.namespaced is False
+        assert fez.plural == "fezzes"
+        assert fez.endpoint == "fezzes"
+    finally:
+        await crd.delete()
 
 
 async def test_pod_to_dict(example_pod_spec):

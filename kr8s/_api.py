@@ -94,6 +94,23 @@ def _apply_op_content_type(op: ApplyOpTypes) -> str:
     return content_types[op]
 
 
+def _server_error(exc: httpx.HTTPStatusError) -> ServerError:
+    """Translate an error response into a ServerError that carries its body.
+
+    The API server answers 5xx with a Status object too, and for a 500 that
+    body is usually the only clue there is, so both classes read the same
+    way. A body that is not a Status -- a proxy's HTML 502, an empty 503 --
+    falls back to httpx' own message, with the raw text as the status.
+    """
+    try:
+        status = exc.response.json()
+        message = status["message"]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        status = exc.response.text
+        message = str(exc)
+    return ServerError(message, status=status, response=exc.response)
+
+
 class Api:
     """A kr8s object for interacting with the Kubernetes API.
 
@@ -123,6 +140,9 @@ class Api:
         self.field_manager = kwargs.get(
             "field_manager", None
         )  # used in Server Side Apply
+        # Set when the first `await` finishes. Left False if it raises, so a
+        # failed authentication is retried rather than cached.
+        self._ready = False
 
         self.auth = KubeAuth(
             url=self._url,
@@ -144,8 +164,13 @@ class Api:
 
     def __await__(self):
         async def f():
-            await self.auth
-            await self._check_version()
+            # Once per instance, not once per `await`: `api()` returns a
+            # cached Api and then awaits it again, so this ran a kubeconfig
+            # read and a `/version` request on every call.
+            if not self._ready:
+                await self.auth
+                await self._check_version()
+                self._ready = True
             return self
 
         return f().__await__()
@@ -249,23 +274,7 @@ class Api:
                     await self._create_session()
                     continue
                 else:
-                    if e.response.status_code >= 400 and e.response.status_code < 500:
-                        try:
-                            error = e.response.json()
-                            error_message = error["message"]
-                        except json.JSONDecodeError:
-                            error = e.response.text
-                            error_message = str(e)
-                        raise ServerError(
-                            error_message, status=error, response=e.response
-                        ) from e
-                    elif e.response.status_code >= 500:
-                        raise ServerError(
-                            str(e),
-                            status=str(e.response.status_code),
-                            response=e.response,
-                        ) from e
-                    raise
+                    raise _server_error(e) from e
             except ssl.SSLCertVerificationError:
                 # In some rare edge cases the SSL verification fails, so we try again
                 # a few times before giving up.
@@ -431,20 +440,27 @@ class Api:
         if group:
             version = f"{group}/{version}"
         for resource in resources:
+            # `parse_kind` lowercases and `resource["kind"]` is CamelCase, so
+            # the Kind comparison must fold case or it matches nothing.
             if (not version or version in resource["version"]) and (
                 kind == resource["name"]
-                or kind == resource["kind"]
+                or kind == resource["kind"].lower()
                 or kind == resource["singularName"]
                 or ("shortNames" in resource and kind in resource["shortNames"])
             ):
+                # The Kind, not the singular name. `new_class` builds a class
+                # straight out of this string, so a lowercase singular here
+                # becomes the class's `kind` and every object of a kind kr8s
+                # has no builtin class for reports a lowercase `.kind`.
+                # `parse_kind` lowercases, so `get_class` is unaffected.
                 if "/" in resource["version"]:
                     return (
-                        f"{resource['singularName']}.{resource['version']}",
+                        f"{resource['kind']}.{resource['version']}",
                         resource["name"],
                         resource["namespaced"],
                     )
                 return (
-                    f"{resource['singularName']}/{resource['version']}",
+                    f"{resource['kind']}/{resource['version']}",
                     resource["name"],
                     resource["namespaced"],
                 )
@@ -464,9 +480,15 @@ class Api:
         params: dict | None = None,
         watch: bool = False,
         allow_unknown_type: bool = True,
+        name: str | None = None,
         **kwargs,
     ) -> AsyncGenerator[tuple[type[APIObject], httpx.Response]]:
-        """Get a Kubernetes resource."""
+        """Get a Kubernetes resource.
+
+        Passing ``name`` requests that one resource by its own URL rather
+        than the collection, so the response is a single object and not a
+        list.
+        """
         from ._objects import get_class, new_class
 
         if not namespace:
@@ -490,6 +512,11 @@ class Api:
             obj_cls = kind
         else:
             namespaced: bool | None = None
+            # Bound here because the lookup below may not reach the
+            # assignment. `new_class` reads None as "derive the plural from
+            # the kind", which is the best guess available once discovery
+            # has failed.
+            plural: str | None = None
             try:
                 kind, plural, namespaced = await self.async_lookup_kind(kind)
             except ServerError as e:
@@ -515,7 +542,7 @@ class Api:
         params = params or None
         async with self.call_api(
             method="GET",
-            url=obj_cls.endpoint,
+            url=f"{obj_cls.endpoint}/{name}" if name else obj_cls.endpoint,
             version=obj_cls.version,
             namespace=namespace if obj_cls.namespaced else None,
             params=params,
@@ -604,7 +631,20 @@ class Api:
         **kwargs,
     ) -> AsyncGenerator[APIObject | dict]:
 
-        if name is not None:
+        # A named resource has a URL of its own, and reading it asks the API
+        # server for the `get` verb. Filtering the collection by
+        # `metadata.name` asks for `list`, which is a wider grant than the
+        # caller wants -- see #680. Anything that really is a list keeps the
+        # collection: a selector still has to be applied, and `kr8s.ALL` has
+        # no single URL for a namespaced kind.
+        single = (
+            name is not None
+            and not label_selector
+            and not field_selector
+            and namespace is not ALL
+        )
+
+        if name is not None and not single:
             # Normalized field_selector to a string
             field_selector_str: str
             if isinstance(field_selector, dict):
@@ -623,46 +663,61 @@ class Api:
             headers["Accept"] = (
                 f"application/json;as={as_object.kind};v={version};g={group}"
             )
-        else:
+        elif not single:
             params["limit"] = 100
         while continue_paging:
-            async with self.async_get_kind(
-                kind,
-                namespace=namespace,
-                label_selector=label_selector,
-                field_selector=field_selector,
-                headers=headers or None,
-                allow_unknown_type=allow_unknown_type,
-                params=params,
-                **kwargs,
-            ) as (obj_cls, response):
-                resourcelist = response.json()
-                if (
-                    as_object
-                    and "kind" in resourcelist
-                    and resourcelist["kind"] == as_object.kind
-                ):
-                    if raw:
-                        yield resourcelist
+            try:
+                async with self.async_get_kind(
+                    kind,
+                    name=name if single else None,
+                    namespace=namespace,
+                    label_selector=label_selector,
+                    field_selector=field_selector,
+                    headers=headers or None,
+                    allow_unknown_type=allow_unknown_type,
+                    params=params,
+                    **kwargs,
+                ) as (obj_cls, response):
+                    resourcelist = response.json()
+                    if (
+                        as_object
+                        and "kind" in resourcelist
+                        and resourcelist["kind"] == as_object.kind
+                    ):
+                        if raw:
+                            yield resourcelist
+                        else:
+                            yield as_object(resourcelist, api=self)
+                    elif single:
+                        if raw:
+                            yield resourcelist
+                        else:
+                            yield obj_cls(resourcelist, api=self)
                     else:
-                        yield as_object(resourcelist, api=self)
-                else:
-                    if "items" in resourcelist:
-                        for item in resourcelist["items"]:
-                            if name is None or item["metadata"]["name"] == name:
-                                if raw:
-                                    yield item
-                                else:
-                                    yield obj_cls(item, api=self)
-                if (
-                    "metadata" in resourcelist
-                    and "continue" in resourcelist["metadata"]
-                    and resourcelist["metadata"]["continue"]
-                ):
-                    continue_paging = True
-                    params["continue"] = resourcelist["metadata"]["continue"]
-                else:
-                    continue_paging = False
+                        if "items" in resourcelist:
+                            for item in resourcelist["items"]:
+                                if name is None or item["metadata"]["name"] == name:
+                                    if raw:
+                                        yield item
+                                    else:
+                                        yield obj_cls(item, api=self)
+                    if (
+                        "metadata" in resourcelist
+                        and "continue" in resourcelist["metadata"]
+                        and resourcelist["metadata"]["continue"]
+                    ):
+                        continue_paging = True
+                        params["continue"] = resourcelist["metadata"]["continue"]
+                    else:
+                        continue_paging = False
+            except ServerError as e:
+                # A name that matches nothing has always given an empty
+                # iterator. On the collection that is an empty `items`; on
+                # the resource's own URL it is a 404. Every other status,
+                # 403 included, still raises, and so does a 404 from a list.
+                if single and e.response is not None and e.response.status_code == 404:
+                    return
+                raise
 
     async def watch(
         self,
@@ -798,9 +853,15 @@ class Api:
     ):
         async with anyio.create_task_group() as tg:
             for resource in resources:
+                # Pass `self`, or the request goes through whichever API the
+                # resource happens to be bound to and the `api` argument of
+                # `kr8s.create()` decides nothing.
                 tg.start_soon(
                     functools.partial(
-                        resource.async_create, validate=validate, dry_run=dry_run
+                        resource.async_create,
+                        validate=validate,
+                        dry_run=dry_run,
+                        api=self,
                     )
                 )
 
