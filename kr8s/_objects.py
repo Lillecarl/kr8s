@@ -8,6 +8,7 @@ import pathlib
 import re
 import sys
 import time
+import warnings
 from collections.abc import AsyncGenerator, Generator
 from typing import (
     Any,
@@ -2310,6 +2311,45 @@ def object_from_spec(
     return cls(spec, api=api)
 
 
+async def _object_from_spec_discovered(
+    spec: dict,
+    api: Api,
+    _asyncio: bool = True,
+) -> APIObject:
+    """`object_from_spec` that asks the server about a kind it does not know.
+
+    `new_class` has to assume the resource is namespaced and that its plural
+    is the kind plus an "s". Both are wrong often enough to matter: a
+    cluster-scoped custom resource then gets a namespaced URL and 404s, and
+    a CRD with an irregular plural never gets a usable endpoint. Discovery
+    knows both, and an api is already in hand here.
+
+    `object_from_spec` cannot do this itself, because it is synchronous and
+    public.
+    """
+    try:
+        return object_from_spec(spec, api=api, _asyncio=_asyncio)
+    except KeyError:
+        pass
+    kind, version = spec["kind"], spec["apiVersion"]
+    # The shape `lookup_kind` parses: a group goes after a dot, a bare
+    # version after a slash.
+    lookup = f"{kind}.{version}" if "/" in version else f"{kind}/{version}"
+    try:
+        _, plural, namespaced = await api.async_lookup_kind(lookup)
+    except (ValueError, ServerError) as e:
+        # The server does not serve it, or discovery failed. Fall back to the
+        # guess rather than refusing to load the file at all -- a manifest
+        # whose own CustomResourceDefinition is not applied yet is ordinary.
+        warnings.warn(str(e), stacklevel=1)
+        cls = new_class(kind, version, asyncio=_asyncio)
+    else:
+        cls = new_class(
+            kind, version, asyncio=_asyncio, namespaced=namespaced, plural=plural
+        )
+    return cls(spec, api=api)
+
+
 async def object_from_name_type(
     name: str,
     namespace: str | None = None,
@@ -2376,8 +2416,8 @@ async def objects_from_files(
         with open(file) as f:
             for doc in yaml.safe_load_all(f):
                 if doc is not None:
-                    obj = object_from_spec(
-                        doc, api=api, allow_unknown_type=True, _asyncio=_asyncio
+                    obj = await _object_from_spec_discovered(
+                        doc, api=api, _asyncio=_asyncio
                     )
                     if _asyncio:
                         await obj
