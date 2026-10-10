@@ -42,6 +42,8 @@ if TYPE_CHECKING:
 if sys.version_info < (3, 11):
     from exceptiongroup import BaseExceptionGroup
 
+# The methods the API server records a field manager for.
+_WRITE_METHODS = frozenset({"POST", "PUT", "PATCH"})
 ALL = "all"
 logger = logging.getLogger(__name__)
 _HTTPX_WS_VERSION = parse_version(metadata_version("httpx-ws"))
@@ -216,6 +218,14 @@ class Api:
             await self._create_session()
         url = self._construct_url(version, base, namespace, url)
         kwargs.update(url=url, method=method)
+        # Every write, not only apply. Without `fieldManager` the API server
+        # names the writer after the User-Agent, so a client bound to a field
+        # manager would apply under one name and create or patch under another.
+        # A caller that names its own manager, as `apply` may, keeps it.
+        if self.field_manager and method in _WRITE_METHODS:
+            params = dict(kwargs.get("params") or {})
+            params.setdefault("fieldManager", self.field_manager)
+            kwargs["params"] = params
         if self.auth.tls_server_name:
             kwargs["extensions"] = {"sni_hostname": self.auth.tls_server_name}
         auth_attempts = 0

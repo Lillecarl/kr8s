@@ -665,6 +665,45 @@ async def test_apply_takes_a_field_manager_per_call(example_pod_spec):
     await pod.delete()
 
 
+async def test_create_and_patch_write_as_the_clients_field_manager(example_pod_spec):
+    """A client bound to a field manager writes under it on every verb, not
+    only on apply. Without `fieldManager` the API server names the writer
+    after the User-Agent, so one client shows up as two managers."""
+    api = await kr8s.asyncio.api(field_manager="bound-writer")
+    pod = await Pod(example_pod_spec, api=api)
+
+    await pod.create()
+    created = {
+        e["manager"]
+        for e in pod.raw["metadata"]["managedFields"]
+        if e["operation"] == "Update" and "subresource" not in e
+    }
+    await pod.patch({"metadata": {"labels": {"patched": "yes"}}})
+    patched = {
+        e["manager"]
+        for e in pod.raw["metadata"]["managedFields"]
+        if e["operation"] == "Update" and "subresource" not in e
+    }
+
+    assert created == {"bound-writer"}, f"create wrote as {created}"
+    assert patched == {"bound-writer"}, f"patch wrote as {patched}"
+    await pod.delete()
+
+
+async def test_a_client_without_a_field_manager_sends_none(example_pod_spec):
+    """Unbound clients keep upstream's behaviour: the server picks the name."""
+    pod = await Pod(example_pod_spec)
+    assert not pod.api.field_manager
+
+    await pod.create()
+    await pod.patch({"metadata": {"labels": {"patched": "yes"}}})
+
+    managers = {e["manager"] for e in pod.raw["metadata"]["managedFields"]}
+    assert managers
+    assert "bound-writer" not in managers
+    await pod.delete()
+
+
 async def test_apply_returns_the_merged_object(example_pod_spec):
     """A dry run stores nothing, so what it returns is the only way to see
     the result. `ekn clusterdiff` is built on exactly this."""
