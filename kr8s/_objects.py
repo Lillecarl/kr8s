@@ -9,6 +9,7 @@ import pathlib
 import re
 import sys
 import time
+import warnings
 from collections.abc import AsyncGenerator, Generator
 from typing import (
     Any,
@@ -57,6 +58,19 @@ from kr8s.portforward import PortForward as SyncPortForward
 logger = logging.getLogger(__name__)
 
 JSONPATH_CONDITION_EXPRESSION = r"jsonpath='{(?P<expression>.*?)}'=(?P<condition>.*)"
+
+
+def _conditions_of(raw: dict) -> list[dict]:
+    """Status conditions of a resource, empty when it has none yet.
+
+    A resource the API server has accepted but not yet given a status has
+    no conditions. Two shapes mean that, and both appear: no ``status`` at
+    all, and a ``conditions`` field set to ``null``. Kubernetes declares
+    CRD conditions without ``omitempty``, so a fresh
+    CustomResourceDefinition takes the second shape and a plain
+    ``.get("conditions", [])`` returns ``None`` from it.
+    """
+    return (raw.get("status") or {}).get("conditions") or []
 
 
 class APIObject:
@@ -304,20 +318,27 @@ class APIObject:
         while start + timeout > time.time():
             if name:
                 try:
+                    # No `field_selector={"metadata.name": name}`. Passing one
+                    # forces `async_get` onto the collection, and reading the
+                    # collection needs the `list` verb where the resource's
+                    # own URL needs only `get`. `async_get` narrows by name on
+                    # its own. See #680.
                     resources = [
                         resource
                         async for resource in api.async_get(
                             cls,
                             name,
                             namespace=namespace,
-                            field_selector={"metadata.name": name},
                             **kwargs,
                         )
                     ]
                 except ServerError as e:
                     if e.response and e.response.status_code == 404:
-                        continue
-                    raise e
+                        # Not `continue`: that skips the backoff below and
+                        # spins on the API server until `timeout` expires.
+                        resources = []
+                    else:
+                        raise e
             elif label_selector or field_selector:
                 resources = [
                     resource
@@ -378,20 +399,28 @@ class APIObject:
         *,
         validate: ValidateOption = "ignore",
         dry_run: DryRunOption = "none",
+        api: Api | None = None,
     ) -> dict:
         """Create this object in Kubernetes.
+
+        Args:
+            validate: How the API server treats fields it does not know.
+            dry_run: Ask what the create would do without storing it.
+            api: Send the request through this API client instead of the one
+                bound to this object. The binding is not changed.
 
         Returns:
             The object as the API server stored it, or would have stored it
             for a dry run.
         """
-        assert self.api
+        api = api or self.api
+        assert api
 
         params = {"fieldValidation": self._field_validation_header(validate)}
         dry_run_param = _dry_run_param(dry_run)
         if dry_run_param:
             params["dryRun"] = dry_run_param
-        async with self.api.call_api(
+        async with api.call_api(
             "POST",
             version=self.version,
             url=self.endpoint,
@@ -412,9 +441,10 @@ class APIObject:
         *,
         validate: ValidateOption = "ignore",
         dry_run: DryRunOption = "none",
+        api: Api | None = None,
     ) -> dict:
         """Create this object in Kubernetes."""
-        return await self.async_create(validate=validate, dry_run=dry_run)
+        return await self.async_create(validate=validate, dry_run=dry_run, api=api)
 
     async def async_apply(
         self,
@@ -789,7 +819,7 @@ class APIObject:
                 if value == "true" or value == "false":
                     value = value.title()
                 status_conditions = list_dict_unpack(
-                    self.status.get("conditions", []), "type", "status"
+                    _conditions_of(self.raw), "type", "status"
                 )
                 results.append(status_conditions.get(field, None) == value)
             elif condition == "delete":
@@ -1159,8 +1189,11 @@ class APIObjectSyncMixin(APIObject):
         *,
         validate: ValidateOption = "ignore",
         dry_run: DryRunOption = "none",
+        api: Api | None = None,
     ):
-        return as_sync_func(self.async_create)(validate=validate, dry_run=dry_run)
+        return as_sync_func(self.async_create)(
+            validate=validate, dry_run=dry_run, api=api
+        )
 
     def apply(
         self,
@@ -1423,7 +1456,7 @@ class Pod(APIObject):
         """Check if the pod is ready."""
         await self.async_refresh()
         conditions = list_dict_unpack(
-            self.status.get("conditions", []),
+            _conditions_of(self.raw),
             key="type",
             value="status",
         )
@@ -2525,6 +2558,45 @@ def object_from_spec(
     return cls(spec, api=api)
 
 
+async def _object_from_spec_discovered(
+    spec: dict,
+    api: Api,
+    _asyncio: bool = True,
+) -> APIObject:
+    """`object_from_spec` that asks the server about a kind it does not know.
+
+    `new_class` has to assume the resource is namespaced and that its plural
+    is the kind plus an "s". Both are wrong often enough to matter: a
+    cluster-scoped custom resource then gets a namespaced URL and 404s, and
+    a CRD with an irregular plural never gets a usable endpoint. Discovery
+    knows both, and an api is already in hand here.
+
+    `object_from_spec` cannot do this itself, because it is synchronous and
+    public.
+    """
+    try:
+        return object_from_spec(spec, api=api, _asyncio=_asyncio)
+    except KeyError:
+        pass
+    kind, version = spec["kind"], spec["apiVersion"]
+    # The shape `lookup_kind` parses: a group goes after a dot, a bare
+    # version after a slash.
+    lookup = f"{kind}.{version}" if "/" in version else f"{kind}/{version}"
+    try:
+        _, plural, namespaced = await api.async_lookup_kind(lookup)
+    except (ValueError, ServerError) as e:
+        # The server does not serve it, or discovery failed. Fall back to the
+        # guess rather than refusing to load the file at all -- a manifest
+        # whose own CustomResourceDefinition is not applied yet is ordinary.
+        warnings.warn(str(e), stacklevel=1)
+        cls = new_class(kind, version, asyncio=_asyncio)
+    else:
+        cls = new_class(
+            kind, version, asyncio=_asyncio, namespaced=namespaced, plural=plural
+        )
+    return cls(spec, api=api)
+
+
 async def object_from_name_type(
     name: str,
     namespace: str | None = None,
@@ -2591,8 +2663,8 @@ async def objects_from_files(
         with open(file) as f:
             for doc in yaml.safe_load_all(f):
                 if doc is not None:
-                    obj = object_from_spec(
-                        doc, api=api, allow_unknown_type=True, _asyncio=_asyncio
+                    obj = await _object_from_spec_discovered(
+                        doc, api=api, _asyncio=_asyncio
                     )
                     if _asyncio:
                         await obj

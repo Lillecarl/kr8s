@@ -6,7 +6,7 @@ import socket
 import subprocess
 import tempfile
 import uuid
-from contextlib import closing
+from contextlib import closing, contextmanager
 from pathlib import Path
 
 import anyio
@@ -188,20 +188,29 @@ async def kubectl_proxy(k8s_cluster):
 
 
 @pytest.fixture(scope="session")
-def k8s_token(k8s_cluster):
-    # Apply the serviceaccount.yaml
-    k8s_cluster.kubectl(
-        "apply", "-f", str(HERE / "tests" / "resources" / "serviceaccount.yaml")
-    )
-    yield k8s_cluster.kubectl("create", "token", "pytest")
-    # Delete the serviceaccount.yaml
-    k8s_cluster.kubectl(
-        "delete", "-f", str(HERE / "tests" / "resources" / "serviceaccount.yaml")
-    )
+def k8s_serviceaccounts(k8s_cluster):
+    """Apply the test service accounts and the roles bound to them."""
+    path = str(HERE / "tests" / "resources" / "serviceaccount.yaml")
+    k8s_cluster.kubectl("apply", "-f", path)
+    yield
+    k8s_cluster.kubectl("delete", "-f", path)
 
 
-@pytest.fixture
-def serviceaccount(k8s_cluster, k8s_token, ns):
+@pytest.fixture(scope="session")
+def k8s_token(k8s_cluster, k8s_serviceaccounts):
+    """A token for a service account with get, list and watch on Pods."""
+    return k8s_cluster.kubectl("create", "token", "pytest")
+
+
+@pytest.fixture(scope="session")
+def k8s_get_only_token(k8s_cluster, k8s_serviceaccounts):
+    """A token for a service account with get on Pods and nothing else."""
+    return k8s_cluster.kubectl("create", "token", "pytest-get-only")
+
+
+@contextmanager
+def _serviceaccount_dir(k8s_cluster, token, namespace):
+    """The directory a Pod's service account is mounted at, built from a token."""
     # Load kubeconfig
     kubeconfig = yaml.safe_load(k8s_cluster.kubeconfig_path.read_text())
 
@@ -221,9 +230,21 @@ def serviceaccount(k8s_cluster, k8s_token, ns):
                 kubeconfig["clusters"][0]["cluster"]["certificate-authority-data"]
             ).decode()
         )
-        (tempdir / "token").write_text(k8s_token)
-        (tempdir / "namespace").write_text(ns)
+        (tempdir / "token").write_text(token)
+        (tempdir / "namespace").write_text(namespace)
         yield str(tempdir)
+
+
+@pytest.fixture
+def serviceaccount(k8s_cluster, k8s_token, ns):
+    with _serviceaccount_dir(k8s_cluster, k8s_token, ns) as path:
+        yield path
+
+
+@pytest.fixture
+def get_only_serviceaccount(k8s_cluster, k8s_get_only_token, ns):
+    with _serviceaccount_dir(k8s_cluster, k8s_get_only_token, ns) as path:
+        yield path
 
 
 @pytest.fixture(autouse=True)
