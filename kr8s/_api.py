@@ -721,10 +721,18 @@ class Api:
                 api["versions"], key=lambda x: x["groupVersion"]
             ):
                 version = api_version["groupVersion"]
-                async with self.call_api(
-                    method="GET", version="", base="/apis", url=version
-                ) as response:
-                    resource = response.json()
+                try:
+                    async with self.call_api(
+                        method="GET", version="", base="/apis", url=version
+                    ) as response:
+                        resource = response.json()
+                except ServerError as e:
+                    # A CustomResourceDefinition that was just created is listed
+                    # in /apis for a few seconds before its group version is
+                    # served. client-go skips such a group too.
+                    if e.response is not None and e.response.status_code == 404:
+                        continue
+                    raise
                 resources.extend(
                     [
                         {"version": version, **r}

@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, patch
 
 import anyio
+import httpx
 import pytest
 from packaging.version import parse as parse_version
 
@@ -301,6 +302,37 @@ async def test_api_resources() -> None:
     assert deployment["version"] == "apps/v1"
     assert "get" in deployment["verbs"]
     assert "deploy" in deployment["shortNames"]
+
+
+async def test_api_resources_skips_unserved_group_version() -> None:
+    api = await kr8s.asyncio.api()
+    call_api = api.call_api
+
+    # /apis lists a group the server does not serve, as it does for a few
+    # seconds after a CustomResourceDefinition is created. The server's own
+    # 404 for that group version is what the discovery has to survive.
+    @asynccontextmanager
+    async def listing_an_unserved_group(**kwargs):
+        async with call_api(**kwargs) as response:
+            if kwargs.get("base") == "/apis" and not kwargs.get("url"):
+                listing = response.json()
+                version = {"groupVersion": "unserved.kr8s.org/v1", "version": "v1"}
+                listing["groups"].append(
+                    {
+                        "name": "unserved.kr8s.org",
+                        "versions": [version],
+                        "preferredVersion": version,
+                    }
+                )
+                response = httpx.Response(200, json=listing)
+            yield response
+
+    with patch.object(api, "call_api", listing_an_unserved_group):
+        resources = await api.async_api_resources_uncached()
+
+    names = [r["name"] for r in resources]
+    assert "deployments" in names
+    assert not [r for r in resources if r["version"] == "unserved.kr8s.org/v1"]
 
 
 async def test_ns(ns) -> None:
